@@ -84,6 +84,13 @@ function warmUpLibreOffice() {
   });
 }
 
+// ── GET /ping — keep-alive endpoint ───────────────────────────────────────
+// Called every 30s from the browser to keep Hostinger's proxy connection warm
+app.get('/ping', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, t: Date.now() });
+});
+
 // ── POST /word-to-pdf ──────────────────────────────────────────────────────
 app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
   let tmpIn = null, tmpOutDir = null;
