@@ -1,7 +1,7 @@
 const express = require('express');
 const multer  = require('multer');
 const cors    = require('cors');
-const { execFile, exec } = require('child_process');
+const { execFile } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
@@ -30,22 +30,23 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// LibreOffice path — installed without sudo in home folder
 const SOFFICE = '/home/u624586258/libreoffice/opt/libreoffice26.2/program/soffice';
 
-// Python path for PDF-to-Word fallback
-const PYTHON = '/usr/bin/python3';
-const CONVERT_PY = path.join(__dirname, 'convert.py');
+// Queue — only one LibreOffice process at a time to prevent crashes
+let loQueue = Promise.resolve();
+function queueLibreOffice(fn) {
+  const result = loQueue.then(fn, fn);
+  loQueue = result.catch(() => {});
+  return result;
+}
 
-function runLibreOffice(args, timeoutMs = 120000) {
+function runLibreOffice(args, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
-    // Set HOME so LibreOffice can write its user profile
     const env = Object.assign({}, process.env, {
       HOME: '/home/u624586258',
       PATH: '/home/u624586258/libreoffice/opt/libreoffice26.2/program:' + (process.env.PATH || '')
     });
-
-    const proc = execFile(SOFFICE, args, { timeout: timeoutMs, env }, (err, stdout, stderr) => {
+    execFile(SOFFICE, args, { timeout: timeoutMs, env }, (err, stdout, stderr) => {
       if (err) {
         console.error('LibreOffice error:', stderr || err.message);
         return reject(new Error(stderr || err.message));
@@ -55,39 +56,9 @@ function runLibreOffice(args, timeoutMs = 120000) {
   });
 }
 
-function runPython(args, inputBuffer, timeoutMs = 60000) {
-  return new Promise((resolve, reject) => {
-    const tmpIn  = path.join(os.tmpdir(), 'in_'  + Date.now() + '_' + Math.random().toString(36).slice(2));
-    const tmpOut = path.join(os.tmpdir(), 'out_' + Date.now() + '_' + Math.random().toString(36).slice(2));
-
-    fs.writeFileSync(tmpIn, inputBuffer);
-
-    const allArgs = [CONVERT_PY, ...args, tmpIn, tmpOut];
-    const env = Object.assign({}, process.env, {
-      HOME: '/home/u624586258'
-    });
-
-    execFile(PYTHON, allArgs, { timeout: timeoutMs, env }, (err, stdout, stderr) => {
-      try { fs.unlinkSync(tmpIn); } catch(e) {}
-      if (err) {
-        try { fs.unlinkSync(tmpOut); } catch(e) {}
-        console.error('Python error:', stderr || err.message);
-        return reject(new Error(stderr || err.message));
-      }
-      try {
-        const outBuf = fs.readFileSync(tmpOut);
-        fs.unlinkSync(tmpOut);
-        resolve(outBuf);
-      } catch(e) {
-        reject(new Error('Output file not created: ' + e.message));
-      }
-    });
-  });
-}
-
 // ── POST /word-to-pdf ──────────────────────────────────────────────────────
 app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
-  let tmpIn = null, tmpOut = null;
+  let tmpIn = null, tmpOutDir = null;
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -98,37 +69,27 @@ app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
 
     console.log(`Converting Word→PDF: ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // Write input to temp file
-    const tmpDir = os.tmpdir();
     const uniqueId = Date.now() + '_' + Math.random().toString(36).slice(2);
-    tmpIn  = path.join(tmpDir, uniqueId + '.' + ext);
-    const tmpOutDir = path.join(tmpDir, uniqueId + '_out');
+    tmpIn     = path.join(os.tmpdir(), uniqueId + '.' + ext);
+    tmpOutDir = path.join(os.tmpdir(), uniqueId + '_out');
 
     fs.writeFileSync(tmpIn, req.file.buffer);
     fs.mkdirSync(tmpOutDir, { recursive: true });
 
-    // Run LibreOffice headless conversion
-    await runLibreOffice([
+    await queueLibreOffice(() => runLibreOffice([
       '--headless',
       '--norestore',
       '--nofirststartwizard',
       '--convert-to', 'pdf',
       '--outdir', tmpOutDir,
       tmpIn
-    ]);
+    ]));
 
     // Find the output PDF
-    const baseName = path.basename(tmpIn, '.' + ext);
-    tmpOut = path.join(tmpOutDir, baseName + '.pdf');
-
-    if (!fs.existsSync(tmpOut)) {
-      // Try to find any PDF in the output dir
-      const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
-      if (files.length === 0) throw new Error('LibreOffice did not produce a PDF output');
-      tmpOut = path.join(tmpOutDir, files[0]);
-    }
-
-    const pdfBuffer = fs.readFileSync(tmpOut);
+    const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
+    if (files.length === 0) throw new Error('LibreOffice did not produce a PDF output');
+    const pdfPath = path.join(tmpOutDir, files[0]);
+    const pdfBuffer = fs.readFileSync(pdfPath);
     const outName = req.file.originalname.replace(/\.(docx|doc|odt|rtf)$/i, '') + '.pdf';
 
     res.set({
@@ -142,20 +103,14 @@ app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
     console.error('word-to-pdf error:', err.message);
     res.status(500).json({ error: 'Conversion failed: ' + err.message });
   } finally {
-    // Clean up temp files
-    try { if (tmpIn)  fs.unlinkSync(tmpIn);  } catch(e) {}
-    try {
-      if (tmpOut) {
-        const outDir = path.dirname(tmpOut);
-        fs.rmSync(outDir, { recursive: true, force: true });
-      }
-    } catch(e) {}
+    try { if (tmpIn) fs.unlinkSync(tmpIn); } catch(e) {}
+    try { if (tmpOutDir) fs.rmSync(tmpOutDir, { recursive: true, force: true }); } catch(e) {}
   }
 });
 
 // ── POST /pdf-to-word ──────────────────────────────────────────────────────
 app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
-  let tmpIn = null, tmpOut = null;
+  let tmpIn = null, tmpOutDir = null;
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -166,17 +121,14 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
 
     console.log(`Converting PDF→Word: ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // Write input to temp file
-    const tmpDir = os.tmpdir();
     const uniqueId = Date.now() + '_' + Math.random().toString(36).slice(2);
-    tmpIn = path.join(tmpDir, uniqueId + '.pdf');
-    const tmpOutDir = path.join(tmpDir, uniqueId + '_out');
+    tmpIn     = path.join(os.tmpdir(), uniqueId + '.pdf');
+    tmpOutDir = path.join(os.tmpdir(), uniqueId + '_out');
 
     fs.writeFileSync(tmpIn, req.file.buffer);
     fs.mkdirSync(tmpOutDir, { recursive: true });
 
-    // LibreOffice: PDF → DOCX
-    await runLibreOffice([
+    await queueLibreOffice(() => runLibreOffice([
       '--headless',
       '--norestore',
       '--nofirststartwizard',
@@ -184,19 +136,12 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
       '--convert-to', 'docx',
       '--outdir', tmpOutDir,
       tmpIn
-    ]);
+    ]));
 
-    // Find output docx
-    const baseName = path.basename(tmpIn, '.pdf');
-    tmpOut = path.join(tmpOutDir, baseName + '.docx');
-
-    if (!fs.existsSync(tmpOut)) {
-      const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.docx'));
-      if (files.length === 0) throw new Error('LibreOffice did not produce a DOCX output');
-      tmpOut = path.join(tmpOutDir, files[0]);
-    }
-
-    const docxBuffer = fs.readFileSync(tmpOut);
+    const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.docx'));
+    if (files.length === 0) throw new Error('LibreOffice did not produce a DOCX output');
+    const docxPath = path.join(tmpOutDir, files[0]);
+    const docxBuffer = fs.readFileSync(docxPath);
     const outName = req.file.originalname.replace(/\.pdf$/i, '') + '.docx';
 
     res.set({
@@ -211,19 +156,13 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
     res.status(500).json({ error: 'Conversion failed: ' + err.message });
   } finally {
     try { if (tmpIn) fs.unlinkSync(tmpIn); } catch(e) {}
-    try {
-      if (tmpOut) {
-        const outDir = path.dirname(tmpOut);
-        fs.rmSync(outDir, { recursive: true, force: true });
-      }
-    } catch(e) {}
+    try { if (tmpOutDir) fs.rmSync(tmpOutDir, { recursive: true, force: true }); } catch(e) {}
   }
 });
 
 // ── Health check ───────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   const mem = process.memoryUsage();
-  // Check if LibreOffice exists
   const loExists = fs.existsSync(SOFFICE);
   res.json({
     status: 'ok',
