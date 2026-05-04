@@ -1,7 +1,7 @@
 const express = require('express');
 const multer  = require('multer');
 const cors    = require('cors');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
@@ -31,8 +31,12 @@ const upload = multer({
 });
 
 const SOFFICE = '/home/u624586258/libreoffice/opt/libreoffice26.2/program/soffice';
+const LO_ENV  = Object.assign({}, process.env, {
+  HOME: '/home/u624586258',
+  PATH: '/home/u624586258/libreoffice/opt/libreoffice26.2/program:' + (process.env.PATH || '')
+});
 
-// Queue — only one LibreOffice process at a time to prevent crashes
+// Queue — only one LibreOffice process at a time
 let loQueue = Promise.resolve();
 function queueLibreOffice(fn) {
   const result = loQueue.then(fn, fn);
@@ -42,11 +46,7 @@ function queueLibreOffice(fn) {
 
 function runLibreOffice(args, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
-    const env = Object.assign({}, process.env, {
-      HOME: '/home/u624586258',
-      PATH: '/home/u624586258/libreoffice/opt/libreoffice26.2/program:' + (process.env.PATH || '')
-    });
-    execFile(SOFFICE, args, { timeout: timeoutMs, env }, (err, stdout, stderr) => {
+    execFile(SOFFICE, args, { timeout: timeoutMs, env: LO_ENV }, (err, stdout, stderr) => {
       if (err) {
         console.error('LibreOffice error:', stderr || err.message);
         return reject(new Error(stderr || err.message));
@@ -54,6 +54,32 @@ function runLibreOffice(args, timeoutMs = 180000) {
       resolve(stdout);
     });
   });
+}
+
+// Warm up LibreOffice on startup by running a dummy conversion
+function warmUpLibreOffice() {
+  console.log('Warming up LibreOffice...');
+  const tmpFile = path.join(os.tmpdir(), 'warmup_' + Date.now() + '.txt');
+  const tmpDir  = path.join(os.tmpdir(), 'warmup_out_' + Date.now());
+  try {
+    fs.writeFileSync(tmpFile, 'warmup');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    execFile(SOFFICE, ['--headless', '--norestore', '--nofirststartwizard',
+      '--convert-to', 'pdf', '--outdir', tmpDir, tmpFile],
+      { timeout: 60000, env: LO_ENV },
+      (err) => {
+        try { fs.unlinkSync(tmpFile); } catch(e) {}
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+        if (err) {
+          console.log('Warmup failed (normal on first run):', err.message);
+        } else {
+          console.log('LibreOffice warmed up successfully!');
+        }
+      }
+    );
+  } catch(e) {
+    console.log('Warmup error:', e.message);
+  }
 }
 
 // ── POST /word-to-pdf ──────────────────────────────────────────────────────
@@ -77,19 +103,16 @@ app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
     fs.mkdirSync(tmpOutDir, { recursive: true });
 
     await queueLibreOffice(() => runLibreOffice([
-      '--headless',
-      '--norestore',
-      '--nofirststartwizard',
+      '--headless', '--norestore', '--nofirststartwizard',
       '--convert-to', 'pdf',
       '--outdir', tmpOutDir,
       tmpIn
     ]));
 
-    // Find the output PDF
     const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
     if (files.length === 0) throw new Error('LibreOffice did not produce a PDF output');
-    const pdfPath = path.join(tmpOutDir, files[0]);
-    const pdfBuffer = fs.readFileSync(pdfPath);
+
+    const pdfBuffer = fs.readFileSync(path.join(tmpOutDir, files[0]));
     const outName = req.file.originalname.replace(/\.(docx|doc|odt|rtf)$/i, '') + '.pdf';
 
     res.set({
@@ -129,9 +152,7 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
     fs.mkdirSync(tmpOutDir, { recursive: true });
 
     await queueLibreOffice(() => runLibreOffice([
-      '--headless',
-      '--norestore',
-      '--nofirststartwizard',
+      '--headless', '--norestore', '--nofirststartwizard',
       '--infilter=writer_pdf_import',
       '--convert-to', 'docx',
       '--outdir', tmpOutDir,
@@ -140,8 +161,8 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
 
     const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.docx'));
     if (files.length === 0) throw new Error('LibreOffice did not produce a DOCX output');
-    const docxPath = path.join(tmpOutDir, files[0]);
-    const docxBuffer = fs.readFileSync(docxPath);
+
+    const docxBuffer = fs.readFileSync(path.join(tmpOutDir, files[0]));
     const outName = req.file.originalname.replace(/\.pdf$/i, '') + '.docx';
 
     res.set({
@@ -160,13 +181,12 @@ app.post('/pdf-to-word', upload.single('file'), async (req, res) => {
   }
 });
 
-// ── Health check ───────────────────────────────────────────────────────────
+// ── Health / ping ──────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   const mem = process.memoryUsage();
-  const loExists = fs.existsSync(SOFFICE);
   res.json({
     status: 'ok',
-    libreoffice: loExists ? 'found' : 'NOT FOUND',
+    libreoffice: fs.existsSync(SOFFICE) ? 'found' : 'NOT FOUND',
     activeRequests,
     memory: {
       used:  Math.round(mem.heapUsed  / 1024 / 1024) + 'MB',
@@ -177,15 +197,19 @@ app.get('/status', (req, res) => {
   });
 });
 
-// ── Self-ping every 4 minutes to keep server warm ─────────────────────────
-const https = require('https');
-setInterval(function(){
-  try {
-    https.get('https://white-wasp-429818.hostingersite.com/status', function(res){
-      res.resume();
-    }).on('error', function(){});
-  } catch(e) {}
-}, 4 * 60 * 1000);
+app.get('/ping', (req, res) => res.json({ pong: true }));
 
+// ── Start server ───────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Word/PDF converter running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Word/PDF converter running on port ${PORT}`);
+  // Warm up LibreOffice immediately on startup
+  setTimeout(warmUpLibreOffice, 2000);
+});
+
+// Self-ping every 3 minutes to stay warm
+const https = require('https');
+setInterval(() => {
+  https.get('https://white-wasp-429818.hostingersite.com/ping', res => res.resume())
+       .on('error', () => {});
+}, 3 * 60 * 1000);
