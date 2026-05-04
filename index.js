@@ -56,41 +56,6 @@ function runLibreOffice(args, timeoutMs = 180000) {
   });
 }
 
-// ── Pre-warm LibreOffice on startup so first real request is fast ──────────
-function warmUpLibreOffice() {
-  console.log('[WARMUP] Pre-warming LibreOffice...');
-  const tmpFile = path.join(os.tmpdir(), 'warmup_' + Date.now() + '.txt');
-  const tmpOut  = path.join(os.tmpdir(), 'warmup_out_' + Date.now());
-  try {
-    fs.writeFileSync(tmpFile, 'warmup');
-    fs.mkdirSync(tmpOut, { recursive: true });
-  } catch(e) {}
-
-  queueLibreOffice(() => runLibreOffice([
-    '--headless', '--norestore', '--nofirststartwizard',
-    '--convert-to', 'pdf',
-    '--outdir', tmpOut,
-    tmpFile
-  ], 60000))
-  .then(() => {
-    console.log('[WARMUP] LibreOffice is warm and ready.');
-  })
-  .catch((e) => {
-    console.warn('[WARMUP] Warm-up failed (non-fatal):', e.message);
-  })
-  .finally(() => {
-    try { fs.unlinkSync(tmpFile); } catch(e) {}
-    try { fs.rmSync(tmpOut, { recursive: true, force: true }); } catch(e) {}
-  });
-}
-
-// ── GET /ping — keep-alive endpoint ───────────────────────────────────────
-// Called every 30s from the browser to keep Hostinger's proxy connection warm
-app.get('/ping', (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, t: Date.now() });
-});
-
 // ── POST /word-to-pdf ──────────────────────────────────────────────────────
 app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
   let tmpIn = null, tmpOutDir = null;
@@ -120,6 +85,7 @@ app.post('/word-to-pdf', upload.single('file'), async (req, res) => {
       tmpIn
     ]));
 
+    // Find the output PDF
     const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
     if (files.length === 0) throw new Error('LibreOffice did not produce a PDF output');
     const pdfPath = path.join(tmpOutDir, files[0]);
@@ -211,9 +177,15 @@ app.get('/status', (req, res) => {
   });
 });
 
+// ── Self-ping every 4 minutes to keep server warm ─────────────────────────
+const https = require('https');
+setInterval(function(){
+  try {
+    https.get('https://white-wasp-429818.hostingersite.com/status', function(res){
+      res.resume();
+    }).on('error', function(){});
+  } catch(e) {}
+}, 4 * 60 * 1000);
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Word/PDF converter running on port ${PORT}`);
-  // Pre-warm LibreOffice immediately on startup
-  warmUpLibreOffice();
-});
+app.listen(PORT, () => console.log(`Word/PDF converter running on port ${PORT}`));
