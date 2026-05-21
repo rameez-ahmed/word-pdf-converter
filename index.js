@@ -1,7 +1,7 @@
 const express = require('express');
 const multer  = require('multer');
 const cors    = require('cors');
-const { execFile, execSync } = require('child_process');
+const { execFile, execSync, spawn } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
@@ -23,13 +23,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// Word→PDF: 10MB limit, PDF→Word: 3MB limit
+// Word→PDF: 10MB limit, PDF→Word: 3MB limit, OCR: 50MB limit
 const uploadWordToPdf = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const uploadPdfToWord = multer({ storage: multer.memoryStorage(), limits: { fileSize: 3 * 1024 * 1024 } });
+const uploadOcr       = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const SOFFICE    = '/home/u624586258/libreoffice/opt/libreoffice26.2/program/soffice';
 const LO_PROGRAM = '/home/u624586258/libreoffice/opt/libreoffice26.2/program';
 const LO_HOME    = '/home/u624586258/libreoffice/opt/libreoffice26.2';
+
+// Tesseract paths
+const TESSERACT  = '/home/u624586258/tesseract-bin/tesseract';
+const TESSDATA   = '/home/u624586258/tesseract-bin/tessdata';
+const GS         = 'gs'; // Ghostscript — system installed
 
 const LO_ENV = Object.assign({}, process.env, {
   HOME:            '/home/u624586258',
@@ -39,7 +45,13 @@ const LO_ENV = Object.assign({}, process.env, {
   LD_LIBRARY_PATH: LO_PROGRAM + ':' + LO_HOME + '/ure-link/lib'
 });
 
-// Queue — only one LibreOffice at a time, resets on failure
+const TESS_ENV = Object.assign({}, process.env, {
+  TESSDATA_PREFIX: TESSDATA,
+  HOME:            '/home/u624586258',
+  PATH:            '/home/u624586258/tesseract-bin:' + (process.env.PATH || '')
+});
+
+// Queue — only one LibreOffice at a time
 let loQueue = Promise.resolve();
 let isConverting = false;
 
@@ -88,6 +100,18 @@ async function convertFile(args, timeoutMs) {
   }
 }
 
+// ── Helper: run a command and return stdout/stderr ─────────────────────────
+function runCmd(bin, args, env, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { timeout: timeoutMs, env: env, maxBuffer: 100 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve({ stdout, stderr });
+      }
+    );
+  });
+}
+
 // ── POST /word-to-pdf ──────────────────────────────────────────────────────
 app.post('/word-to-pdf', uploadWordToPdf.single('file'), async (req, res) => {
   let tmpIn = null, tmpOutDir = null;
@@ -117,7 +141,11 @@ app.post('/word-to-pdf', uploadWordToPdf.single('file'), async (req, res) => {
 
     const buf = fs.readFileSync(path.join(tmpOutDir, files[0]));
     const outName = req.file.originalname.replace(/\.(docx|doc|odt|rtf)$/i,'') + '.pdf';
-    res.set({ 'Content-Type':'application/pdf', 'Content-Disposition':`attachment; filename="${outName}"`, 'Content-Length': buf.length });
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${outName}"`,
+      'Content-Length': buf.length
+    });
     res.send(buf);
 
   } catch(err) {
@@ -146,7 +174,6 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
     fs.writeFileSync(tmpIn, req.file.buffer);
     fs.mkdirSync(tmpOutDir, { recursive: true });
 
-    // Strict 45 second timeout for PDF→Word
     await queueLibreOffice(() => convertFile([
       '--headless','--norestore','--nofirststartwizard',
       '--infilter=writer_pdf_import',
@@ -159,7 +186,11 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
 
     const buf = fs.readFileSync(path.join(tmpOutDir, files[0]));
     const outName = req.file.originalname.replace(/\.pdf$/i,'') + '.docx';
-    res.set({ 'Content-Type':'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'Content-Disposition':`attachment; filename="${outName}"`, 'Content-Length': buf.length });
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'Content-Disposition': `attachment; filename="${outName}"`,
+      'Content-Length': buf.length
+    });
     res.send(buf);
 
   } catch(err) {
@@ -174,15 +205,147 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
   }
 });
 
+// ── POST /ocr-pdf ──────────────────────────────────────────────────────────
+// Pipeline: PDF → Ghostscript 300DPI PNG → Tesseract PDF output → merged PDF
+// Tesseract's native PDF output mode produces a perfect invisible text layer
+// identical to what Adobe Acrobat and ilovepdf produce.
+app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
+  const tmpDir = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+
+    // Validate it's actually a PDF
+    const header = req.file.buffer.slice(0, 5).toString('ascii');
+    if (!header.startsWith('%PDF')) return res.status(400).json({ error: 'Only PDF files are accepted' });
+
+    const lang = (req.body.lang || 'eng').replace(/[^a-z_]/g, '');
+    const validLangs = ['eng','ara','urd','fra','deu','spa','por','ita','nld','rus',
+      'chi_sim','chi_tra','jpn','kor','hin','ben','tur','pol','ukr','vie',
+      'tha','heb','fas','swe','nor','dan','fin','ces','ron','hun','ind','afr','swa'];
+    const safeLang = validLangs.includes(lang) ? lang : 'eng';
+
+    // Check tessdata for requested language — fall back to eng if missing
+    const tessDataFile = path.join(TESSDATA, safeLang + '.traineddata');
+    const actualLang   = fs.existsSync(tessDataFile) ? safeLang : 'eng';
+
+    console.log(`OCR: ${req.file.originalname} (${req.file.size} bytes) lang=${actualLang}`);
+
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // Save uploaded PDF
+    const inputPdf = path.join(tmpDir, 'input.pdf');
+    fs.writeFileSync(inputPdf, req.file.buffer);
+
+    // ── STEP 1: Ghostscript → render each page to PNG at 300 DPI ──
+    const pngPattern = path.join(tmpDir, 'page_%04d.png');
+    console.log('OCR: Rendering pages with Ghostscript...');
+    await runCmd(GS, [
+      '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+      '-sDEVICE=png16m',
+      '-r300',                  // 300 DPI — same as ilovepdf
+      '-dTextAlphaBits=4',      // anti-aliasing for better OCR
+      '-dGraphicsAlphaBits=4',
+      '-dUseCropBox',
+      `-sOutputFile=${pngPattern}`,
+      inputPdf
+    ], process.env, 120000); // 2 min timeout for rendering
+
+    // Find rendered pages
+    const pages = fs.readdirSync(tmpDir)
+      .filter(f => f.match(/^page_\d+\.png$/))
+      .sort()
+      .map(f => path.join(tmpDir, f));
+
+    if (!pages.length) throw new Error('No pages could be rendered from this PDF');
+    console.log(`OCR: Rendered ${pages.length} pages`);
+
+    // ── STEP 2: Tesseract → PDF output mode per page ──
+    // Tesseract's PDF output mode creates a PERFECT searchable PDF:
+    // - Original page image embedded at correct size
+    // - Invisible text layer at exact character positions
+    // - Character-level selection works in all PDF viewers
+    const pagePdfs = [];
+    for (let i = 0; i < pages.length; i++) {
+      const pagePng = pages[i];
+      const outBase = path.join(tmpDir, `tess_${String(i).padStart(4,'0')}`);
+      console.log(`OCR: Tesseract page ${i+1}/${pages.length}...`);
+
+      try {
+        await runCmd(TESSERACT, [
+          pagePng,
+          outBase,
+          '-l', actualLang,
+          '--oem', '1',   // LSTM engine — best accuracy
+          '--psm', '3',   // auto page segmentation
+          'pdf'           // output format: searchable PDF
+        ], TESS_ENV, 120000); // 2 min per page
+
+        const pdfOut = outBase + '.pdf';
+        if (fs.existsSync(pdfOut)) {
+          pagePdfs.push(pdfOut);
+        }
+      } catch(err) {
+        console.error(`OCR: Tesseract failed on page ${i+1}:`, err.message);
+        // Continue with other pages even if one fails
+      }
+    }
+
+    if (!pagePdfs.length) throw new Error('OCR failed on all pages');
+    console.log(`OCR: Tesseract completed ${pagePdfs.length}/${pages.length} pages`);
+
+    // ── STEP 3: Merge all page PDFs into one final PDF ──
+    const finalPdf = path.join(tmpDir, 'final_searchable.pdf');
+    console.log('OCR: Merging pages...');
+    await runCmd(GS, [
+      '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+      '-sDEVICE=pdfwrite',
+      '-dCompatibilityLevel=1.5',
+      '-dPDFSETTINGS=/default',
+      `-sOutputFile=${finalPdf}`,
+      ...pagePdfs
+    ], process.env, 120000);
+
+    if (!fs.existsSync(finalPdf)) throw new Error('Failed to merge output PDF');
+
+    const resultBuf  = fs.readFileSync(finalPdf);
+    const outName    = (req.file.originalname || 'document').replace(/\.pdf$/i, '') + '-searchable.pdf';
+
+    console.log(`OCR: Done — ${resultBuf.length} bytes, ${pages.length} pages`);
+
+    res.set({
+      'Content-Type':        'application/pdf',
+      'Content-Disposition': `attachment; filename="${outName}"`,
+      'Content-Length':      resultBuf.length,
+      'X-OCR-Pages':         pages.length,
+      'X-OCR-Lang':          actualLang,
+      'Access-Control-Expose-Headers': 'X-OCR-Pages, X-OCR-Lang'
+    });
+    res.send(resultBuf);
+
+  } catch(err) {
+    console.error('ocr-pdf error:', err.message);
+    res.status(500).json({ error: err.message || 'OCR processing failed' });
+  } finally {
+    // Clean up temp files
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
 // ── Status / ping ──────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   const mem = process.memoryUsage();
   res.json({
-    status: 'ok',
-    libreoffice: fs.existsSync(SOFFICE) ? 'found' : 'NOT FOUND',
+    status:       'ok',
+    libreoffice:  fs.existsSync(SOFFICE)    ? 'found' : 'NOT FOUND',
+    tesseract:    fs.existsSync(TESSERACT)  ? 'found' : 'NOT FOUND',
+    ghostscript:  'system',
     isConverting,
     activeRequests,
-    memory: { used: Math.round(mem.heapUsed/1024/1024)+'MB', rss: Math.round(mem.rss/1024/1024)+'MB' },
+    memory: {
+      used: Math.round(mem.heapUsed/1024/1024) + 'MB',
+      rss:  Math.round(mem.rss/1024/1024) + 'MB'
+    },
     uptime: Math.round(process.uptime()) + 's'
   });
 });
@@ -191,10 +354,10 @@ app.get('/ping', (req, res) => res.json({ pong: true }));
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Word/PDF converter running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Converter + OCR running on port ${PORT}`));
 
-// Self-ping every 3 minutes
+// Self-ping every 3 minutes to keep alive
 const https = require('https');
 setInterval(() => {
-  https.get('https://white-wasp-429818.hostingersite.com/ping', r => r.resume()).on('error',()=>{});
+  https.get('https://white-wasp-429818.hostingersite.com/ping', r => r.resume()).on('error', () => {});
 }, 3 * 60 * 1000);
