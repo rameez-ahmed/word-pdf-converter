@@ -205,6 +205,68 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
   }
 });
 
+
+// ── buildTextLayerPS ──────────────────────────────────────────────────────
+// Converts hOCR HTML into a PostScript pdfmark that adds invisible text
+// to a PDF page. Called per-page after Ghostscript renders the image.
+// hOCR bbox coords are in pixels at 300 DPI → convert to PDF points (72 DPI)
+function buildTextLayerPS(hocrHtml) {
+  const PX_TO_PT = 72 / 300; // 300 DPI render → 72pt PDF
+
+  // Extract page bbox to get page height (needed to flip Y axis)
+  const pageMatch = hocrHtml.match(/class=['"]ocr_page['"][^>]*title=['"][^'"]*bbox\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/);
+  if (!pageMatch) return null;
+  const pageH_px = parseInt(pageMatch[4]);
+  const pageH_pt = pageH_px * PX_TO_PT;
+
+  // Extract all words with bboxes
+  const wordRe = /class=['"]ocrx_word['"][^>]*title=['"][^'"]*bbox\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)[^'"]*['"][^>]*>(.*?)<\/span>/gsi;
+  let match;
+  const words = [];
+  while ((match = wordRe.exec(hocrHtml)) !== null) {
+    const text = match[5].replace(/<[^>]+>/g, '').replace(/&amp;/g,'&')
+      .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').trim();
+    if (!text) continue;
+    const x0 = parseInt(match[1]) * PX_TO_PT;
+    const y0 = parseInt(match[2]) * PX_TO_PT;
+    const x1 = parseInt(match[3]) * PX_TO_PT;
+    const y1 = parseInt(match[4]) * PX_TO_PT;
+    const w  = x1 - x0;
+    const h  = y1 - y0;
+    if (w <= 0 || h <= 0) continue;
+    // Flip Y: PDF origin is bottom-left, hOCR origin is top-left
+    const pdfY = pageH_pt - y1;
+    words.push({ text, x: x0, y: pdfY, w, h });
+  }
+
+  if (!words.length) return null;
+
+  // Build PostScript with pdfmark for invisible text
+  let ps = '%!PS-Adobe-3.0\n';
+  ps += '% Invisible text layer\n';
+  ps += 'mark\n';
+
+  for (const word of words) {
+    const fontSize = Math.max(word.h, 4);
+    // Escape PS string: backslash and parentheses
+    const escaped = word.text
+      .replace(/\\/g, '\\\\')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)');
+
+    ps += `[ /Rect [${word.x.toFixed(2)} ${word.y.toFixed(2)} ${(word.x+word.w).toFixed(2)} ${(word.y+word.h).toFixed(2)}]\n`;
+    ps += `  /Subtype /FreeText\n`;
+    ps += `  /Contents (${escaped})\n`;
+    ps += `  /F 3\n`; // invisible flag
+    ps += `  /BS << /W 0 >>\n`;
+    ps += `  /DA (/Helv ${fontSize.toFixed(1)} Tf 0 g)\n`;
+    ps += `  /pdfmark\n`;
+  }
+
+  ps += 'cleartomark\n';
+  return ps;
+}
+
 // ── POST /ocr-pdf ──────────────────────────────────────────────────────────
 // Pipeline: PDF → Ghostscript 300DPI PNG → Tesseract PDF output → merged PDF
 // Tesseract's native PDF output mode produces a perfect invisible text layer
@@ -260,66 +322,120 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     if (!pages.length) throw new Error('No pages could be rendered from this PDF');
     console.log(`OCR: Rendered ${pages.length} pages`);
 
-    // ── STEP 2: Tesseract → PDF output mode per page ──
-    // Tesseract's PDF output mode creates a PERFECT searchable PDF:
-    // - Original page image embedded at correct size
-    // - Invisible text layer at exact character positions
-    // - Character-level selection works in all PDF viewers
-    const pagePdfs = [];
+    // ── STEP 2: Tesseract → hOCR output per page ──
+    // The static Tesseract binary supports hOCR output (word-level bounding boxes)
+    // We use this to build a proper searchable PDF with Ghostscript
+    const hocrFiles = [];
     for (let i = 0; i < pages.length; i++) {
       const pagePng = pages[i];
-      const outBase = path.join(tmpDir, `tess_${String(i).padStart(4,'0')}`);
+      const outBase = path.resolve(path.join(tmpDir, `tess_${String(i).padStart(4,'0')}`));
       console.log(`OCR: Tesseract page ${i+1}/${pages.length}...`);
 
       try {
-        // Tesseract needs absolute paths and writes output as outBase + '.pdf'
-        // We pass the full absolute output base path
-        const absPagePng = path.resolve(pagePng);
-        const absOutBase = path.resolve(outBase);
-
-        console.log(`OCR: Running tesseract on ${absPagePng} -> ${absOutBase}`);
-
         await runCmd(TESSERACT, [
-          absPagePng,
-          absOutBase,
+          path.resolve(pagePng),
+          outBase,
           '-l', actualLang,
-          '--oem', '1',   // LSTM engine — best accuracy
-          '--psm', '3',   // auto page segmentation
-          'pdf'           // output format: searchable PDF
-        ], TESS_ENV, 120000); // 2 min per page
+          '--oem', '1',
+          '--psm', '3',
+          'hocr'   // hOCR = word positions + text
+        ], TESS_ENV, 120000);
 
-        const pdfOut = absOutBase + '.pdf';
-        console.log(`OCR: Checking for output at ${pdfOut}`);
-
-        if (fs.existsSync(pdfOut)) {
-          console.log(`OCR: Page ${i+1} PDF found (${fs.statSync(pdfOut).size} bytes)`);
-          pagePdfs.push(pdfOut);
+        const hocrOut = outBase + '.hocr';
+        if (fs.existsSync(hocrOut)) {
+          console.log(`OCR: Page ${i+1} hOCR found`);
+          hocrFiles.push({ hocr: hocrOut, png: pagePng });
         } else {
-          // List what IS in tmpDir to debug
-          const dirContents = fs.readdirSync(tmpDir);
-          console.error(`OCR: PDF not found. tmpDir contains: ${dirContents.join(', ')}`);
+          // Try .txt fallback
+          const txtOut = outBase + '.txt';
+          if (fs.existsSync(txtOut)) {
+            console.log(`OCR: Page ${i+1} only .txt found — will embed text only`);
+            hocrFiles.push({ txt: txtOut, png: pagePng });
+          } else {
+            console.error(`OCR: No output for page ${i+1}`);
+            hocrFiles.push({ png: pagePng }); // image only, no text
+          }
         }
       } catch(err) {
         console.error(`OCR: Tesseract failed on page ${i+1}:`, err.message);
-        // List dir contents for debugging
+        hocrFiles.push({ png: pagePng });
+      }
+    }
+
+    console.log(`OCR: Tesseract completed ${hocrFiles.length} pages`);
+
+    // ── STEP 3: Build searchable PDF using Ghostscript ──
+    // Strategy:
+    // 1. Convert each PNG to a single-page PDF (preserves image quality)
+    // 2. Inject hOCR text as invisible text layer via pdfmark
+    // 3. Merge all pages into final PDF
+
+    const pagePdfs = [];
+    for (let i = 0; i < hocrFiles.length; i++) {
+      const pageData  = hocrFiles[i];
+      const pagePdf   = path.join(tmpDir, `page_${String(i).padStart(4,'0')}.pdf`);
+
+      // Convert PNG → PDF with Ghostscript (300 DPI → 72pt page)
+      await runCmd(GS, [
+        '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.5',
+        `-sOutputFile=${pagePdf}`,
+        '-c', '<</Orientation 0>> setpagedevice',
+        '-f', pageData.png
+      ], process.env, 60000);
+
+      if (!fs.existsSync(pagePdf)) {
+        console.error(`OCR: Failed to create page PDF for page ${i+1}`);
+        continue;
+      }
+
+      // If we have hOCR, inject invisible text layer
+      if (pageData.hocr) {
         try {
-          const dirContents = fs.readdirSync(tmpDir);
-          console.error(`OCR: tmpDir contains: ${dirContents.join(', ')}`);
-        } catch(e2) {}
+          const hocrContent = fs.readFileSync(pageData.hocr, 'utf8');
+          const textLayer   = buildTextLayerPS(hocrContent);
+          if (textLayer) {
+            const psFile      = path.join(tmpDir, `text_${i}.ps`);
+            const layeredPdf  = path.join(tmpDir, `layered_${i}.pdf`);
+            fs.writeFileSync(psFile, textLayer);
+
+            await runCmd(GS, [
+              '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+              '-sDEVICE=pdfwrite',
+              '-dCompatibilityLevel=1.5',
+              `-sOutputFile=${layeredPdf}`,
+              pagePdf,
+              psFile
+            ], process.env, 60000);
+
+            if (fs.existsSync(layeredPdf)) {
+              pagePdfs.push(layeredPdf);
+              console.log(`OCR: Page ${i+1} has invisible text layer`);
+            } else {
+              pagePdfs.push(pagePdf);
+            }
+          } else {
+            pagePdfs.push(pagePdf);
+          }
+        } catch(e) {
+          console.error(`OCR: Text layer injection failed page ${i+1}:`, e.message);
+          pagePdfs.push(pagePdf);
+        }
+      } else {
+        pagePdfs.push(pagePdf); // image-only page
       }
     }
 
     if (!pagePdfs.length) throw new Error('OCR failed on all pages');
-    console.log(`OCR: Tesseract completed ${pagePdfs.length}/${pages.length} pages`);
 
-    // ── STEP 3: Merge all page PDFs into one final PDF ──
+    // ── STEP 4: Merge all pages into final PDF ──
     const finalPdf = path.join(tmpDir, 'final_searchable.pdf');
     console.log('OCR: Merging pages...');
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=pdfwrite',
       '-dCompatibilityLevel=1.5',
-      '-dPDFSETTINGS=/default',
       `-sOutputFile=${finalPdf}`,
       ...pagePdfs
     ], process.env, 120000);
