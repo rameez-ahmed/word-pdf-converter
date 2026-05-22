@@ -272,22 +272,40 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       console.log(`OCR: Tesseract page ${i+1}/${pages.length}...`);
 
       try {
+        // Tesseract needs absolute paths and writes output as outBase + '.pdf'
+        // We pass the full absolute output base path
+        const absPagePng = path.resolve(pagePng);
+        const absOutBase = path.resolve(outBase);
+
+        console.log(`OCR: Running tesseract on ${absPagePng} -> ${absOutBase}`);
+
         await runCmd(TESSERACT, [
-          pagePng,
-          outBase,
+          absPagePng,
+          absOutBase,
           '-l', actualLang,
           '--oem', '1',   // LSTM engine — best accuracy
           '--psm', '3',   // auto page segmentation
           'pdf'           // output format: searchable PDF
         ], TESS_ENV, 120000); // 2 min per page
 
-        const pdfOut = outBase + '.pdf';
+        const pdfOut = absOutBase + '.pdf';
+        console.log(`OCR: Checking for output at ${pdfOut}`);
+
         if (fs.existsSync(pdfOut)) {
+          console.log(`OCR: Page ${i+1} PDF found (${fs.statSync(pdfOut).size} bytes)`);
           pagePdfs.push(pdfOut);
+        } else {
+          // List what IS in tmpDir to debug
+          const dirContents = fs.readdirSync(tmpDir);
+          console.error(`OCR: PDF not found. tmpDir contains: ${dirContents.join(', ')}`);
         }
       } catch(err) {
         console.error(`OCR: Tesseract failed on page ${i+1}:`, err.message);
-        // Continue with other pages even if one fails
+        // List dir contents for debugging
+        try {
+          const dirContents = fs.readdirSync(tmpDir);
+          console.error(`OCR: tmpDir contains: ${dirContents.join(', ')}`);
+        } catch(e2) {}
       }
     }
 
