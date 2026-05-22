@@ -338,19 +338,46 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       }
     }
 
-    // ── STEP 3: Ghostscript merges all PNGs into one visual PDF ──
+    // ── STEP 3: Convert each PNG to PDF, then merge ──
+    // GS cannot directly batch-convert PNGs to PDF in one pass.
+    // We convert each PNG individually first, then merge all page PDFs.
+    const pagePdfs = [];
+    for (let i = 0; i < pages.length; i++) {
+      const pagePdf = path.join(tmpDir, 'pg_' + String(i).padStart(4,'0') + '.pdf');
+      console.log('OCR: Converting page ' + (i+1) + ' PNG to PDF...');
+      try {
+        await runCmd(GS, [
+          '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+          '-sDEVICE=pdfwrite',
+          '-dCompatibilityLevel=1.5',
+          '-dFIXEDMEDIA',
+          '-dPDFFitPage',
+          '-sOutputFile=' + pagePdf,
+          pages[i]
+        ], process.env, 60000);
+        if (fs.existsSync(pagePdf)) {
+          pagePdfs.push(pagePdf);
+        } else {
+          console.error('OCR: Page PDF not created for page ' + (i+1));
+        }
+      } catch(e) {
+        console.error('OCR: PNG->PDF failed page ' + (i+1) + ':', e.message);
+      }
+    }
+
+    if (!pagePdfs.length) throw new Error('Failed to convert any pages to PDF');
+
+    // Merge all page PDFs into one visual PDF
     const visualPdf = path.join(tmpDir, 'visual.pdf');
-    console.log('OCR: Building PDF from ' + pages.length + ' pages...');
+    console.log('OCR: Merging ' + pagePdfs.length + ' page PDFs...');
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=pdfwrite',
       '-dCompatibilityLevel=1.5',
-      '-dPDFSETTINGS=/default',
-      '-dAutoRotatePages=/None',
       '-sOutputFile=' + visualPdf
-    ].concat(pages), process.env, 180000);
+    ].concat(pagePdfs), process.env, 120000);
 
-    if (!fs.existsSync(visualPdf)) throw new Error('Failed to build output PDF');
+    if (!fs.existsSync(visualPdf)) throw new Error('Failed to merge page PDFs');
     console.log('OCR: Visual PDF created (' + fs.statSync(visualPdf).size + ' bytes)');
 
     // ── STEP 4: Inject searchable text via pdfmark PostScript ──
