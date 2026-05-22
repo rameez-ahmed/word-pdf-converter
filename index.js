@@ -338,83 +338,48 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       }
     }
 
-    // ── STEP 3: Convert each PNG to PDF, then merge ──
-    // GS cannot directly batch-convert PNGs to PDF in one pass.
-    // We convert each PNG individually first, then merge all page PDFs.
-    const pagePdfs = [];
-    for (let i = 0; i < pages.length; i++) {
-      const pagePdf = path.join(tmpDir, 'pg_' + String(i).padStart(4,'0') + '.pdf');
-      console.log('OCR: Converting page ' + (i+1) + ' PNG to PDF...');
-      try {
-        await runCmd(GS, [
-          '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-          '-sDEVICE=pdfwrite',
-          '-dCompatibilityLevel=1.5',
-          '-dFIXEDMEDIA',
-          '-dPDFFitPage',
-          '-sOutputFile=' + pagePdf,
-          pages[i]
-        ], process.env, 60000);
-        if (fs.existsSync(pagePdf)) {
-          pagePdfs.push(pagePdf);
-        } else {
-          console.error('OCR: Page PDF not created for page ' + (i+1));
-        }
-      } catch(e) {
-        console.error('OCR: PNG->PDF failed page ' + (i+1) + ':', e.message);
-      }
-    }
-
-    if (!pagePdfs.length) throw new Error('Failed to convert any pages to PDF');
-
-    // Merge all page PDFs into one visual PDF
+    // ── STEP 3: Convert all PNGs to PDF using Python + Pillow ──
+    // Ghostscript cannot convert PNG→PDF on this server.
+    // Pillow (PIL) is available and handles this perfectly.
     const visualPdf = path.join(tmpDir, 'visual.pdf');
-    console.log('OCR: Merging ' + pagePdfs.length + ' page PDFs...');
-    await runCmd(GS, [
-      '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-      '-sDEVICE=pdfwrite',
-      '-dCompatibilityLevel=1.5',
-      '-sOutputFile=' + visualPdf
-    ].concat(pagePdfs), process.env, 120000);
+    console.log('OCR: Converting ' + pages.length + ' PNGs to PDF with Pillow...');
 
-    if (!fs.existsSync(visualPdf)) throw new Error('Failed to merge page PDFs');
-    console.log('OCR: Visual PDF created (' + fs.statSync(visualPdf).size + ' bytes)');
-
-    // ── STEP 4: Inject searchable text via pdfmark PostScript ──
-    const allText = pageTexts.join('\n\n--- Page Break ---\n\n');
-    const cleanText = allText
-      .replace(/\\/g, '\\\\')
-      .replace(/\(/g, '\\(')
-      .replace(/\)/g, '\\)')
-      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
-      .substring(0, 65000);
-
-    const psContent = [
-      '%!PS-Adobe-3.0',
-      '% Searchable text layer via pdfmark',
-      '[ /Title (' + cleanText.substring(0, 200).replace(/\n/g, ' ') + ')',
-      '  /DOCINFO pdfmark'
+    const pyScript = path.join(tmpDir, 'make_pdf.py');
+    const pyCode = [
+      'from PIL import Image',
+      'import sys, json',
+      'pages = json.loads(sys.argv[1])',
+      'out   = sys.argv[2]',
+      'imgs  = []',
+      'for p in pages:',
+      '    img = Image.open(p).convert("RGB")',
+      '    imgs.append(img)',
+      'if imgs:',
+      '    imgs[0].save(out, save_all=True, append_images=imgs[1:], resolution=72)',
+      '    print("OK:" + str(len(imgs)))',
+      'else:',
+      '    print("ERROR:no images")',
+      '    sys.exit(1)'
     ].join('\n');
 
-    const textPsFile = path.join(tmpDir, 'textlayer.ps');
-    const finalPdf   = path.join(tmpDir, 'final.pdf');
-    fs.writeFileSync(textPsFile, psContent);
+    fs.writeFileSync(pyScript, pyCode);
 
-    try {
-      await runCmd(GS, [
-        '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-        '-sDEVICE=pdfwrite',
-        '-dCompatibilityLevel=1.5',
-        '-sOutputFile=' + finalPdf,
-        visualPdf,
-        textPsFile
-      ], process.env, 60000);
-    } catch(e) {
-      console.log('OCR: pdfmark failed, using visual PDF:', e.message);
-      fs.copyFileSync(visualPdf, finalPdf);
-    }
+    const pyResult = await runCmd('python3', [
+      pyScript,
+      JSON.stringify(pages),
+      visualPdf
+    ], process.env, 120000);
 
-    const outPdf = fs.existsSync(finalPdf) ? finalPdf : visualPdf;
+    console.log('OCR: Pillow result:', pyResult.stdout.trim());
+
+    if (!fs.existsSync(visualPdf)) throw new Error('Failed to build PDF from PNG pages');
+    console.log('OCR: Visual PDF created (' + fs.statSync(visualPdf).size + ' bytes)');
+
+    // ── STEP 4: Use visual PDF as final output ──
+    // The PDF contains the scanned pages at full quality.
+    // Text extracted by Tesseract is returned in response headers
+    // for the frontend text panel.
+    const outPdf = visualPdf;
     const resultBuf = fs.readFileSync(outPdf);
     const outName = (req.file.originalname || 'document').replace(/\.pdf$/i, '') + '-searchable.pdf';
 
