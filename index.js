@@ -130,8 +130,7 @@ app.post('/word-to-pdf', uploadWordToPdf.single('file'), async (req, res) => {
     fs.mkdirSync(tmpOutDir, { recursive: true });
     await queueLibreOffice(() => convertFile([
       '--headless','--norestore','--nofirststartwizard',
-      '--convert-to','pdf',
-      '--outdir', tmpOutDir, tmpIn
+      '--convert-to','pdf','--outdir', tmpOutDir, tmpIn
     ], 60000));
     const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
     if (!files.length) throw new Error('No PDF output produced');
@@ -164,8 +163,7 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
     await queueLibreOffice(() => convertFile([
       '--headless','--norestore','--nofirststartwizard',
       '--infilter=writer_pdf_import',
-      '--convert-to','docx',
-      '--outdir', tmpOutDir, tmpIn
+      '--convert-to','docx','--outdir', tmpOutDir, tmpIn
     ], 45000));
     const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.docx'));
     if (!files.length) throw new Error('No DOCX output produced');
@@ -203,19 +201,16 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
 
     console.log('OCR: ' + req.file.originalname + ' (' + req.file.size + ' bytes) lang=' + actualLang);
     fs.mkdirSync(tmpDir, { recursive: true });
-
-    const inputPdf  = path.join(tmpDir, 'input.pdf');
-    fs.writeFileSync(inputPdf, req.file.buffer);
+    fs.writeFileSync(path.join(tmpDir, 'input.pdf'), req.file.buffer);
 
     // STEP 1: Ghostscript → PNG pages at 300 DPI
     console.log('OCR: Rendering pages...');
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=png16m', '-r300',
-      '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4',
-      '-dUseCropBox',
+      '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4', '-dUseCropBox',
       '-sOutputFile=' + path.join(tmpDir, 'page_%04d.png'),
-      inputPdf
+      path.join(tmpDir, 'input.pdf')
     ], process.env, 120000);
 
     const pages = fs.readdirSync(tmpDir)
@@ -226,7 +221,10 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     if (!pages.length) throw new Error('No pages could be rendered');
     console.log('OCR: Rendered ' + pages.length + ' pages');
 
-    // STEP 2: Tesseract → text per page
+    // STEP 2: Tesseract → tsv output per page (gives word bounding boxes)
+    // TSV format: level, page_num, block_num, par_num, line_num, word_num,
+    //             left, top, width, height, conf, text
+    const pageTsvs = [];
     const pageTexts = [];
     for (let i = 0; i < pages.length; i++) {
       const outBase = path.join(tmpDir, 'tess_' + String(i).padStart(4,'0'));
@@ -234,94 +232,149 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       try {
         await runCmd(TESSERACT, [
           path.resolve(pages[i]), path.resolve(outBase),
-          '-l', actualLang, '--oem', '1', '--psm', '3', 'txt'
+          '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv', 'txt'
         ], TESS_ENV, 120000);
-        const txt = outBase + '.txt';
+        const tsv  = outBase + '.tsv';
+        const txt  = outBase + '.txt';
+        pageTsvs.push(fs.existsSync(tsv) ? tsv : null);
         const text = fs.existsSync(txt) ? fs.readFileSync(txt, 'utf8').trim() : '';
         pageTexts.push(text);
         console.log('OCR: Page ' + (i+1) + ' → ' + text.length + ' chars');
       } catch(e) {
         console.error('OCR: Tesseract p' + (i+1) + ' failed:', e.message);
+        pageTsvs.push(null);
         pageTexts.push('');
       }
     }
 
-    // STEP 3: Python/Pillow → visual PDF from PNGs
-    console.log('OCR: Building PDF with Pillow...');
-    const visualPdf = path.join(tmpDir, 'visual.pdf');
-    const pyScript  = path.join(tmpDir, 'makepdf.py');
+    // STEP 3: Python builds searchable PDF
+    // Uses Pillow for images + ReportLab for invisible text layer
+    // ReportLab places each word at exact TSV bounding box coordinates
+    // with render mode = invisible → perfect selectable text
+    console.log('OCR: Building searchable PDF with ReportLab...');
 
-    // Write Python script to a file — no escaping issues
-    const pyLines = [];
-    pyLines.push('from PIL import Image');
-    pyLines.push('import sys, json');
-    pyLines.push('pages = json.loads(open(sys.argv[1]).read())');
-    pyLines.push('out   = sys.argv[2]');
-    pyLines.push('imgs  = [Image.open(p).convert("RGB") for p in pages]');
-    pyLines.push('if not imgs: sys.exit(1)');
-    pyLines.push('imgs[0].save(out, save_all=True, append_images=imgs[1:], resolution=300)');
-    pyLines.push('print("OK:" + str(len(imgs)))');
-    fs.writeFileSync(pyScript, pyLines.join('\n'));
-
-    // Write pages list as JSON file — no command line escaping needed
+    const pyScript      = path.join(tmpDir, 'build_pdf.py');
     const pagesJsonFile = path.join(tmpDir, 'pages.json');
+    const tsvsJsonFile  = path.join(tmpDir, 'tsvs.json');
+    const finalPdf      = path.join(tmpDir, 'final.pdf');
+
     fs.writeFileSync(pagesJsonFile, JSON.stringify(pages));
+    fs.writeFileSync(tsvsJsonFile,  JSON.stringify(pageTsvs));
 
-    const pyResult = await runCmd(PYTHON3, [pyScript, pagesJsonFile, visualPdf], PY_ENV, 120000);
-    console.log('OCR: Pillow result:', pyResult.stdout.trim());
+    // Write the Python script as separate lines — no JS escaping issues
+    const py = [];
+    py.push('import sys, json, os');
+    py.push('from PIL import Image');
+    py.push('from reportlab.pdfgen import canvas');
+    py.push('from reportlab.lib.units import inch');
+    py.push('');
+    py.push('pages     = json.loads(open(sys.argv[1]).read())');
+    py.push('tsvs      = json.loads(open(sys.argv[2]).read())');
+    py.push('out_path  = sys.argv[3]');
+    py.push('');
+    py.push('def parse_tsv(tsv_file):');
+    py.push('    words = []');
+    py.push('    if not tsv_file or not os.path.exists(tsv_file):');
+    py.push('        return words');
+    py.push('    with open(tsv_file, "r", encoding="utf-8") as f:');
+    py.push('        lines = f.read().splitlines()');
+    py.push('    if len(lines) < 2:');
+    py.push('        return words');
+    py.push('    for line in lines[1:]:');
+    py.push('        parts = line.split("\\t")');
+    py.push('        if len(parts) < 12:');
+    py.push('            continue');
+    py.push('        try:');
+    py.push('            conf = float(parts[10])');
+    py.push('            if conf < 0:');
+    py.push('                continue');
+    py.push('            text = parts[11].strip()');
+    py.push('            if not text:');
+    py.push('                continue');
+    py.push('            left   = int(parts[6])');
+    py.push('            top    = int(parts[7])');
+    py.push('            width  = int(parts[8])');
+    py.push('            height = int(parts[9])');
+    py.push('            words.append((text, left, top, width, height))');
+    py.push('        except:');
+    py.push('            pass');
+    py.push('    return words');
+    py.push('');
+    py.push('# Create PDF with ReportLab');
+    py.push('# Page size comes from actual PNG dimensions');
+    py.push('first_img = Image.open(pages[0])');
+    py.push('img_w, img_h = first_img.size');
+    py.push('# 300 DPI render → PDF points: 1 point = 1/72 inch');
+    py.push('# px * 72 / 300 = pts');
+    py.push('scale = 72.0 / 300.0');
+    py.push('pdf_w = img_w * scale');
+    py.push('pdf_h = img_h * scale');
+    py.push('');
+    py.push('c = canvas.Canvas(out_path, pagesize=(pdf_w, pdf_h))');
+    py.push('');
+    py.push('for i, (png_path, tsv_path) in enumerate(zip(pages, tsvs)):');
+    py.push('    img = Image.open(png_path)');
+    py.push('    iw, ih = img.size');
+    py.push('    pw = iw * scale');
+    py.push('    ph = ih * scale');
+    py.push('    c.setPageSize((pw, ph))');
+    py.push('');
+    py.push('    # Draw the scanned page image as background');
+    py.push('    c.drawImage(png_path, 0, 0, width=pw, height=ph)');
+    py.push('');
+    py.push('    # Draw invisible text layer on top');
+    py.push('    # render mode 3 = invisible (no fill, no stroke)');
+    py.push('    # but text IS in the PDF character stream → selectable');
+    py.push('    words = parse_tsv(tsv_path)');
+    py.push('    for (text, left, top, width, height) in words:');
+    py.push('        # Convert px coords to PDF points');
+    py.push('        # PDF Y origin = bottom-left; image Y origin = top-left');
+    py.push('        x    = left   * scale');
+    py.push('        y    = ph - (top + height) * scale');
+    py.push('        w    = width  * scale');
+    py.push('        h    = height * scale');
+    py.push('        if w <= 0 or h <= 0:');
+    py.push('            continue');
+    py.push('        font_size = max(h * 0.9, 1)');
+    py.push('        # Set text render mode 3 = invisible');
+    py.push('        c.setFont("Helvetica", font_size)');
+    py.push('        c.saveState()');
+    py.push('        # renderMode 3: fill=invisible, stroke=invisible');
+    py.push('        c._code.append("3 Tr")');
+    py.push('        # Scale text width to match visual word width');
+    py.push('        try:');
+    py.push('            actual_w = c.stringWidth(text, "Helvetica", font_size)');
+    py.push('            if actual_w > 0:');
+    py.push('                scale_x = w / actual_w');
+    py.push('                c.transform(scale_x, 0, 0, 1, x - x*scale_x, 0)');
+    py.push('                c.drawString(x / scale_x, y, text)');
+    py.push('            else:');
+    py.push('                c.drawString(x, y, text)');
+    py.push('        except:');
+    py.push('            c.drawString(x, y, text)');
+    py.push('        c.restoreState()');
+    py.push('');
+    py.push('    c.showPage()');
+    py.push('    print("Page " + str(i+1) + " done")');
+    py.push('');
+    py.push('c.save()');
+    py.push('print("PDF saved: " + out_path)');
 
-    if (!fs.existsSync(visualPdf)) throw new Error('Pillow failed to create PDF');
-    console.log('OCR: Visual PDF: ' + fs.statSync(visualPdf).size + ' bytes');
+    fs.writeFileSync(pyScript, py.join('\n'));
 
-    // STEP 4: Add invisible text layer via Ghostscript pdfmark
-    // This makes text selectable in PDF viewers
-    console.log('OCR: Adding text layer...');
-    const psFile  = path.join(tmpDir, 'textlayer.ps');
-    const finalPdf = path.join(tmpDir, 'final.pdf');
+    const pyResult = await runCmd(PYTHON3, [
+      pyScript, pagesJsonFile, tsvsJsonFile, finalPdf
+    ], PY_ENV, 300000); // 5 min timeout
 
-    // Write PostScript pdfmark file for invisible text layer
-    // We write one annotation per page with the extracted text
-    const psLines = [];
-    psLines.push('%!PS-Adobe-3.0');
-    pageTexts.forEach(function(text, i) {
-      if (!text) return;
-      // Clean text for PS string — remove non-printable chars
-      const safe = text
-        .replace(/[\\]/g, '\\\\')
-        .replace(/[(]/g, '\\(')
-        .replace(/[)]/g, '\\)')
-        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
-        .substring(0, 16000);
-      psLines.push('[ /Page ' + (i+1));
-      psLines.push('  /Rect [0 0 612 792]');
-      psLines.push('  /Subtype /FreeText');
-      psLines.push('  /Contents (' + safe + ')');
-      psLines.push('  /F 6');
-      psLines.push('  /BS << /W 0 >>');
-      psLines.push('  /DA (/Helvetica 0 Tf 0 g)');
-      psLines.push('  /pdfmark');
-    });
-    fs.writeFileSync(psFile, psLines.join('\n'));
+    console.log('OCR: Python result:', pyResult.stdout.trim().split('\n').pop());
 
-    try {
-      await runCmd(GS, [
-        '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-        '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.5',
-        '-sOutputFile=' + finalPdf,
-        visualPdf, psFile
-      ], process.env, 60000);
-    } catch(e) {
-      console.log('OCR: Text layer failed, using visual:', e.message);
-      fs.copyFileSync(visualPdf, finalPdf);
-    }
+    if (!fs.existsSync(finalPdf)) throw new Error('Python failed to create PDF');
+    console.log('OCR: Final PDF: ' + fs.statSync(finalPdf).size + ' bytes');
 
-    const outPdf    = fs.existsSync(finalPdf) ? finalPdf : visualPdf;
-    const resultBuf = fs.readFileSync(outPdf);
+    const resultBuf = fs.readFileSync(finalPdf);
     const outName   = (req.file.originalname || 'document').replace(/\.pdf$/i,'') + '-searchable.pdf';
-
-    // Send extracted text back to frontend (base64, max 8KB header)
-    const allText  = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
-    const textB64  = Buffer.from(allText.substring(0, 6000)).toString('base64');
+    const allText   = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
+    const textB64   = Buffer.from(allText.substring(0, 6000)).toString('base64');
 
     console.log('OCR: Done — ' + resultBuf.length + ' bytes, ' + pages.length + ' pages');
 
@@ -348,7 +401,7 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
 app.get('/status', (req, res) => {
   const mem = process.memoryUsage();
   res.json({
-    status:      'ok',
+    status: 'ok',
     libreoffice: fs.existsSync(SOFFICE)   ? 'found' : 'NOT FOUND',
     tesseract:   fs.existsSync(TESSERACT) ? 'found' : 'NOT FOUND',
     ghostscript: 'system',
