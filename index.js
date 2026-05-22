@@ -355,7 +355,7 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       '    img = Image.open(p).convert("RGB")',
       '    imgs.append(img)',
       'if imgs:',
-      '    imgs[0].save(out, save_all=True, append_images=imgs[1:], resolution=72)',
+      '    imgs[0].save(out, save_all=True, append_images=imgs[1:], resolution=300)',
       '    print("OK:" + str(len(imgs)))',
       'else:',
       '    print("ERROR:no images")',
@@ -364,11 +364,16 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
 
     fs.writeFileSync(pyScript, pyCode);
 
-    const pyResult = await runCmd('python3', [
+    // Use full path + PYTHONPATH so user-installed Pillow is found by Node.js
+    const pyEnv = Object.assign({}, process.env, {
+      HOME:       '/home/u624586258',
+      PYTHONPATH: '/home/u624586258/.local/lib/python3.9/site-packages'
+    });
+    const pyResult = await runCmd('/usr/bin/python3', [
       pyScript,
       JSON.stringify(pages),
       visualPdf
-    ], process.env, 120000);
+    ], pyEnv, 120000);
 
     console.log('OCR: Pillow result:', pyResult.stdout.trim());
 
