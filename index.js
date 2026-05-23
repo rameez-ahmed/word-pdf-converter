@@ -58,13 +58,12 @@ const PY_ENV = Object.assign({}, process.env, {
     PYTHONPATH: PYTHONPATH
 });
 
-// Setup Tesseract configs
+// Setup Tesseract
 function setupTesseractConfigs() {
     const configDir = path.join(TESSDATA, 'configs');
     try {
         fs.mkdirSync(configDir, { recursive: true });
         fs.writeFileSync(path.join(configDir, 'tsv'), 'tessedit_create_tsv 1\n');
-        fs.writeFileSync(path.join(configDir, 'hocr'), 'tessedit_create_hocr 1\n');
         console.log('Tesseract configs ready');
     } catch (e) {
         console.error('Tesseract config error:', e.message);
@@ -121,7 +120,7 @@ async function convertFile(args, timeoutMs) {
         return await runLibreOffice(args, timeoutMs);
     } catch (err) {
         if (err.message === 'STUCK' || err.message === 'TIMEOUT') {
-            console.log('LibreOffice stuck/timeout — killing and retrying once...');
+            console.log('LibreOffice stuck/timeout — killing and retrying...');
             killLibreOffice();
             await new Promise(r => setTimeout(r, 2000));
             return await runLibreOffice(args, timeoutMs);
@@ -130,15 +129,13 @@ async function convertFile(args, timeoutMs) {
     }
 }
 
-// ── POST /word-to-pdf (UNCHANGED) ─────────────────────────────────────
+// ── WORD TO PDF (Unchanged) ─────────────────────────────────────
 app.post('/word-to-pdf', uploadWordToPdf.single('file'), async (req, res) => {
     let tmpIn = null, tmpOutDir = null;
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
         const ext = req.file.originalname.split('.').pop().toLowerCase();
         if (!['docx','doc','odt','rtf'].includes(ext)) return res.status(400).json({ error: 'Only .docx, .doc, .odt and .rtf supported' });
-
-        console.log(`Converting Word→PDF: ${req.file.originalname} (${req.file.size} bytes)`);
 
         const uid = Date.now() + '_' + Math.random().toString(36).slice(2);
         tmpIn = path.join(os.tmpdir(), uid + '.' + ext);
@@ -147,41 +144,31 @@ app.post('/word-to-pdf', uploadWordToPdf.single('file'), async (req, res) => {
         fs.writeFileSync(tmpIn, req.file.buffer);
         fs.mkdirSync(tmpOutDir, { recursive: true });
 
-        await queueLibreOffice(() => convertFile([
-            '--headless', '--norestore', '--nofirststartwizard',
-            '--convert-to', 'pdf', '--outdir', tmpOutDir, tmpIn
-        ], 60000));
+        await queueLibreOffice(() => convertFile(['--headless','--norestore','--nofirststartwizard','--convert-to','pdf','--outdir', tmpOutDir, tmpIn], 60000));
 
         const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.pdf'));
-        if (!files.length) throw new Error('No PDF output produced');
+        if (!files.length) throw new Error('No PDF output');
 
         const buf = fs.readFileSync(path.join(tmpOutDir, files[0]));
-        const outName = req.file.originalname.replace(/\.(docx|doc|odt|rtf)$/i, '') + '.pdf';
+        const outName = req.file.originalname.replace(/\.(docx|doc|odt|rtf)$/i,'') + '.pdf';
 
-        res.set({
-            'Content-Type': 'application/pdf',
-            'Content-Disposition': `attachment; filename="${outName}"`,
-            'Content-Length': buf.length
-        });
+        res.set({ 'Content-Type':'application/pdf', 'Content-Disposition': `attachment; filename="${outName}"`, 'Content-Length': buf.length });
         res.send(buf);
-    } catch (err) {
+    } catch(err) {
         console.error('word-to-pdf error:', err.message);
-        res.status(500).json({ error: 'Conversion failed: ' + err.message });
+        res.status(500).json({ error: 'Conversion failed' });
     } finally {
-        try { if (tmpIn) fs.unlinkSync(tmpIn); } catch (e) {}
-        try { if (tmpOutDir) fs.rmSync(tmpOutDir, { recursive: true, force: true }); } catch (e) {}
+        try { if(tmpIn) fs.unlinkSync(tmpIn); } catch(e) {}
+        try { if(tmpOutDir) fs.rmSync(tmpOutDir,{recursive:true,force:true}); } catch(e) {}
     }
 });
 
-// ── POST /pdf-to-word (UNCHANGED) ─────────────────────────────────────
+// ── PDF TO WORD (Unchanged) ─────────────────────────────────────
 app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
     let tmpIn = null, tmpOutDir = null;
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-        const ext = req.file.originalname.split('.').pop().toLowerCase();
-        if (ext !== 'pdf') return res.status(400).json({ error: 'Only PDF files supported' });
-
-        console.log(`Converting PDF→Word: ${req.file.originalname} (${req.file.size} bytes)`);
+        if (req.file.originalname.split('.').pop().toLowerCase() !== 'pdf') return res.status(400).json({ error: 'Only PDF supported' });
 
         const uid = Date.now() + '_' + Math.random().toString(36).slice(2);
         tmpIn = path.join(os.tmpdir(), uid + '.pdf');
@@ -190,239 +177,141 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
         fs.writeFileSync(tmpIn, req.file.buffer);
         fs.mkdirSync(tmpOutDir, { recursive: true });
 
-        await queueLibreOffice(() => convertFile([
-            '--headless', '--norestore', '--nofirststartwizard',
-            '--infilter=writer_pdf_import', '--convert-to', 'docx',
-            '--outdir', tmpOutDir, tmpIn
-        ], 45000));
+        await queueLibreOffice(() => convertFile(['--headless','--norestore','--nofirststartwizard','--infilter=writer_pdf_import','--convert-to','docx','--outdir', tmpOutDir, tmpIn], 45000));
 
         const files = fs.readdirSync(tmpOutDir).filter(f => f.endsWith('.docx'));
-        if (!files.length) throw new Error('No DOCX output produced');
+        if (!files.length) throw new Error('No DOCX output');
 
         const buf = fs.readFileSync(path.join(tmpOutDir, files[0]));
-        const outName = req.file.originalname.replace(/\.pdf$/i, '') + '.docx';
+        const outName = req.file.originalname.replace(/\.pdf$/i,'') + '.docx';
 
-        res.set({
-            'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'Content-Disposition': `attachment; filename="${outName}"`,
-            'Content-Length': buf.length
-        });
+        res.set({ 'Content-Type':'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'Content-Disposition': `attachment; filename="${outName}"`, 'Content-Length': buf.length });
         res.send(buf);
-    } catch (err) {
+    } catch(err) {
         console.error('pdf-to-word error:', err.message);
-        const msg = (err.message === 'TIMEOUT' || err.message.includes('TIMEOUT'))
-            ? 'This PDF is too complex to convert. Try a simpler or smaller PDF.'
-            : 'Conversion failed: ' + err.message;
-        res.status(500).json({ error: msg });
+        res.status(500).json({ error: 'Conversion failed' });
     } finally {
-        try { if (tmpIn) fs.unlinkSync(tmpIn); } catch (e) {}
-        try { if (tmpOutDir) fs.rmSync(tmpOutDir, { recursive: true, force: true }); } catch (e) {}
+        try { if(tmpIn) fs.unlinkSync(tmpIn); } catch(e) {}
+        try { if(tmpOutDir) fs.rmSync(tmpOutDir,{recursive:true,force:true}); } catch(e) {}
     }
 });
 
-// ── POST /ocr-pdf (FIXED) ─────────────────────────────────────────────
+// ── OCR PDF (NEW - Using PyMuPDF) ─────────────────────────────────
 app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     const tmpDir = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
     try {
         if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
-
-        const header = req.file.buffer.slice(0, 5).toString('ascii');
-        if (!header.startsWith('%PDF')) return res.status(400).json({ error: 'Only PDF files are accepted' });
+        if (!req.file.buffer.slice(0, 5).toString('ascii').startsWith('%PDF')) return res.status(400).json({ error: 'Only PDF files accepted' });
 
         const lang = (req.body.lang || 'eng').replace(/[^a-z_]/g, '');
         const validLangs = ['eng','ara','urd','fra','deu','spa','por','ita','nld','rus','chi_sim','chi_tra','jpn','kor','hin','ben','tur','pol','ukr','vie','tha','heb','fas','swe','nor','dan','fin','ces','ron','hun','ind','afr','swa'];
-        const safeLang = validLangs.includes(lang) ? lang : 'eng';
-        const tessData = path.join(TESSDATA, safeLang + '.traineddata');
-        const actualLang = fs.existsSync(tessData) ? safeLang : 'eng';
+        const actualLang = validLangs.includes(lang) && fs.existsSync(path.join(TESSDATA, lang + '.traineddata')) ? lang : 'eng';
 
-        console.log(`OCR: ${req.file.originalname} (${req.file.size} bytes) lang=${actualLang}`);
+        console.log(`OCR Started: ${req.file.originalname} (${req.file.size} bytes) Lang: ${actualLang}`);
 
         fs.mkdirSync(tmpDir, { recursive: true });
         fs.writeFileSync(path.join(tmpDir, 'input.pdf'), req.file.buffer);
 
-        // STEP 1: Ghostscript → PNG
-        console.log('OCR: Rendering pages...');
-        await runCmd(GS, [
-            '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-            '-sDEVICE=png16m', '-r300', '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4',
-            '-dUseCropBox',
-            '-sOutputFile=' + path.join(tmpDir, 'page_%04d.png'),
-            path.join(tmpDir, 'input.pdf')
-        ], process.env, 120000);
+        // Render pages
+        await runCmd(GS, ['-q','-dBATCH','-dNOPAUSE','-dSAFER','-sDEVICE=png16m','-r400','-dTextAlphaBits=4','-dGraphicsAlphaBits=4','-dUseCropBox',`-sOutputFile=${path.join(tmpDir, 'page_%04d.png')}`, path.join(tmpDir, 'input.pdf')], process.env, 150000);
 
-        const pages = fs.readdirSync(tmpDir)
-            .filter(f => f.match(/^page_\d+\.png$/))
-            .sort()
-            .map(f => path.join(tmpDir, f));
+        const pages = fs.readdirSync(tmpDir).filter(f => f.match(/^page_\d+\.png$/)).sort().map(f => path.join(tmpDir, f));
 
-        if (!pages.length) throw new Error('No pages could be rendered');
-
-        console.log(`OCR: Rendered ${pages.length} pages`);
-
-        // STEP 2: Tesseract → TSV
-        const pageTsvs = [];
-        const pageTexts = [];
-
+        // Tesseract
+        const pageTsvs = [], pageTexts = [];
         for (let i = 0; i < pages.length; i++) {
-            const outBase = path.join(tmpDir, 'tess_' + String(i).padStart(4, '0'));
-            console.log(`OCR: Tesseract page ${i + 1}/${pages.length}`);
-
-            try {
-                await runCmd(TESSERACT, [
-                    path.resolve(pages[i]),
-                    path.resolve(outBase),
-                    '-l', actualLang,
-                    '--oem', '1',
-                    '--psm', '3',
-                    'tsv'
-                ], TESS_ENV, 120000);
-
-                const tsv = outBase + '.tsv';
-                if (fs.existsSync(tsv)) {
-                    pageTsvs.push(tsv);
-                    const words = fs.readFileSync(tsv, 'utf8').split('\n').slice(1)
-                        .map(l => l.split('\t'))
-                        .filter(p => p.length >= 12 && parseFloat(p[10]) > 0 && p[11]?.trim())
-                        .map(p => p[11].trim());
-                    pageTexts.push(words.join(' '));
-                } else {
-                    pageTsvs.push(null);
-                    pageTexts.push('');
-                }
-            } catch (e) {
-                console.error(`OCR: Tesseract p${i+1} failed:`, e.message);
+            const outBase = path.join(tmpDir, `tess_${String(i).padStart(4,'0')}`);
+            await runCmd(TESSERACT, [pages[i], outBase, '-l', actualLang, '--oem', '3', '--psm', '6', 'tsv'], TESS_ENV, 90000);
+            
+            const tsv = outBase + '.tsv';
+            if (fs.existsSync(tsv)) {
+                pageTsvs.push(tsv);
+                const text = fs.readFileSync(tsv, 'utf8').split('\n').slice(1).map(l => l.split('\t')[11]).filter(Boolean).join(' ');
+                pageTexts.push(text.trim());
+            } else {
                 pageTsvs.push(null);
                 pageTexts.push('');
             }
         }
 
-        // STEP 3: Build Searchable PDF with FIXED ReportLab logic
-        console.log('OCR: Building searchable PDF...');
+        // Build PDF with PyMuPDF
         const pyScript = path.join(tmpDir, 'build_pdf.py');
-        const pagesJsonFile = path.join(tmpDir, 'pages.json');
-        const tsvsJsonFile = path.join(tmpDir, 'tsvs.json');
+        const pagesJson = path.join(tmpDir, 'pages.json');
+        const tsvsJson = path.join(tmpDir, 'tsvs.json');
         const finalPdf = path.join(tmpDir, 'final.pdf');
 
-        fs.writeFileSync(pagesJsonFile, JSON.stringify(pages));
-        fs.writeFileSync(tsvsJsonFile, JSON.stringify(pageTsvs));
+        fs.writeFileSync(pagesJson, JSON.stringify(pages));
+        fs.writeFileSync(tsvsJson, JSON.stringify(pageTsvs));
 
         const pyCode = `
 import sys, json, os
+import fitz
 from PIL import Image
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 
 pages = json.loads(open(sys.argv[1]).read())
 tsvs = json.loads(open(sys.argv[2]).read())
 out_path = sys.argv[3]
 
-SCALE = 72.0 / 300.0
-
-def parse_tsv(tsv_file):
+def parse_tsv(tsv_path):
+    if not tsv_path or not os.path.exists(tsv_path): return []
     words = []
-    if not tsv_file or not os.path.exists(tsv_file): return words
-    for line in open(tsv_file, encoding="utf-8").read().splitlines()[1:]:
-        p = line.split('\t')
-        if len(p) < 12: continue
+    for line in open(tsv_path, encoding='utf-8').read().splitlines()[1:]:
+        parts = line.split('\t')
+        if len(parts) < 12: continue
         try:
-            if float(p[10]) <= 0: continue
-            text = p[11].strip()
+            if float(parts[10]) < 30: continue
+            text = parts[11].strip()
             if not text: continue
-            left, top, width, height = int(p[6]), int(p[7]), int(p[8]), int(p[9])
-            if width > 0 and height > 0:
-                words.append((text, left, top, width, height))
+            x0 = int(parts[6])
+            y0 = int(parts[7])
+            x1 = x0 + int(parts[8])
+            y1 = y0 + int(parts[9])
+            words.append((text, x0, y0, x1, y1))
         except: pass
     return words
 
-img0 = Image.open(pages[0])
-w0, h0 = img0.size
-c = canvas.Canvas(out_path, pagesize=(w0*SCALE, h0*SCALE))
-
-for i, (png, tsv) in enumerate(zip(pages, tsvs)):
-    img = Image.open(png)
-    iw, ih = img.size
-    pw, ph = iw*SCALE, ih*SCALE
-    c.setPageSize((pw, ph))
-
-    c.drawImage(ImageReader(img), 0, 0, width=pw, height=ph)
-
-    words = parse_tsv(tsv)
-    if words:
-        t = c.beginText()
-        t.setTextRenderMode(3)  # Invisible text
-        for (text, left, top, width, height) in words:
-            x = left * SCALE
-            y = ph - (top + height) * SCALE
-            fs = max(height * SCALE * 0.85, 2.0)
-            t.setFont("Helvetica", fs)
-            t.setTextOrigin(x, y)
-            t.textOut(text)
-        c.drawText(t)
+doc = fitz.open()
+for i, (png_path, tsv_path) in enumerate(zip(pages, tsvs)):
+    w, h = Image.open(png_path).size
+    page = doc.new_page(width=w, height=h)
+    page.insert_image(page.rect, filename=png_path)
     
+    words = parse_tsv(tsv_path)
+    if words:
+        for text, x0, y0, x1, y1 in words:
+            rect = fitz.Rect(x0, y0, x1, y1)
+            page.insert_textbox(rect, text, fontsize=(y1-y0)*0.82, fontname="helv", render_mode=3)
     print(f"Page {i+1}: {len(words)} words")
-    c.showPage()
-
-c.save()
-print("PDF saved: " + out_path)
+    
+doc.save(out_path, deflate=True, clean=True)
+doc.close()
+print("Searchable PDF created")
 `;
 
-        fs.writeFileSync(pyScript, pyCode.trim());
-
-        const pyResult = await runCmd(PYTHON3, [pyScript, pagesJsonFile, tsvsJsonFile, finalPdf], PY_ENV, 300000);
-
-        if (!fs.existsSync(finalPdf)) throw new Error('Failed to create searchable PDF');
+        fs.writeFileSync(pyScript, pyCode);
+        await runCmd(PYTHON3, [pyScript, pagesJson, tsvsJson, finalPdf], PY_ENV, 180000);
 
         const resultBuf = fs.readFileSync(finalPdf);
         const outName = (req.file.originalname || 'document').replace(/\.pdf$/i, '') + '-searchable.pdf';
-        const allText = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
-        const textB64 = Buffer.from(allText.substring(0, 6000)).toString('base64');
-
-        console.log(`OCR: Done — ${resultBuf.length} bytes, ${pages.length} pages`);
 
         res.set({
             'Content-Type': 'application/pdf',
             'Content-Disposition': `attachment; filename="${outName}"`,
-            'Content-Length': resultBuf.length,
-            'X-OCR-Pages': pages.length,
-            'X-OCR-Lang': actualLang,
-            'X-OCR-Text': textB64,
-            'Access-Control-Expose-Headers': 'X-OCR-Pages, X-OCR-Lang, X-OCR-Text'
+            'Content-Length': resultBuf.length
         });
         res.send(resultBuf);
 
     } catch (err) {
-        console.error('ocr-pdf error:', err.message);
-        res.status(500).json({ error: err.message || 'OCR processing failed' });
+        console.error('OCR Error:', err.message);
+        res.status(500).json({ error: 'OCR processing failed. Try a clearer document.' });
     } finally {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
     }
 });
 
-// Status Routes
-app.get('/status', (req, res) => {
-    const mem = process.memoryUsage();
-    res.json({
-        status: 'ok',
-        libreoffice: fs.existsSync(SOFFICE) ? 'found' : 'NOT FOUND',
-        tesseract: fs.existsSync(TESSERACT) ? 'found' : 'NOT FOUND',
-        ghostscript: 'system',
-        isConverting,
-        activeRequests,
-        memory: {
-            used: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
-            rss: Math.round(mem.rss / 1024 / 1024) + 'MB'
-        },
-        uptime: Math.round(process.uptime()) + 's'
-    });
-});
-
+// Status
+app.get('/status', (req, res) => res.json({ status: 'ok' }));
 app.get('/ping', (req, res) => res.json({ pong: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Converter + OCR running on port ' + PORT));
-
-// Keep-alive
-const https = require('https');
-setInterval(() => {
-    https.get('https://white-wasp-429818.hostingersite.com/ping', r => r.resume()).on('error', () => {});
-}, 3 * 60 * 1000);
+app.listen(PORT, () => console.log('OCR Server running on port ' + PORT));
