@@ -232,8 +232,8 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
           path.resolve(pages[i]), path.resolve(outBase),
           '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv', 'txt'
         ], TESS_ENV, 120000);
-        const tsv  = outBase + '.tsv';
-        const txt  = outBase + '.txt';
+        const tsv = outBase + '.tsv';
+        const txt = outBase + '.txt';
         pageTsvs.push(fs.existsSync(tsv) ? tsv : null);
         pageTexts.push(fs.existsSync(txt) ? fs.readFileSync(txt, 'utf8').trim() : '');
         console.log('OCR: Page ' + (i+1) + ' → ' + pageTexts[i].length + ' chars');
@@ -244,9 +244,9 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       }
     }
 
-    // STEP 3: Python/ReportLab builds searchable PDF
-    // The key: we draw image first, then overlay text with opacity=0
-    // using ReportLab's low-level PDF operators for true invisible text
+    // STEP 3: Python/ReportLab → searchable PDF
+    // Image drawn first, then invisible text on top using Tm (absolute matrix)
+    // Tm places each word independently — no cumulative Td offset errors
     console.log('OCR: Building searchable PDF...');
 
     const pyScript      = path.join(tmpDir, 'build_pdf.py');
@@ -258,21 +258,19 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     fs.writeFileSync(tsvsJsonFile,  JSON.stringify(pageTsvs));
 
     const py = [];
-    py.push('import sys, json, os, struct');
+    py.push('import sys, json, os');
     py.push('from PIL import Image');
     py.push('from reportlab.pdfgen import canvas');
     py.push('from reportlab.lib.utils import ImageReader');
-    py.push('from io import BytesIO');
     py.push('');
     py.push('pages    = json.loads(open(sys.argv[1]).read())');
     py.push('tsvs     = json.loads(open(sys.argv[2]).read())');
     py.push('out_path = sys.argv[3]');
-    py.push('SCALE    = 72.0 / 300.0  # 300 DPI -> PDF points');
+    py.push('SCALE    = 72.0 / 300.0');
     py.push('');
     py.push('def parse_tsv(tsv_file):');
     py.push('    words = []');
-    py.push('    if not tsv_file or not os.path.exists(tsv_file):');
-    py.push('        return words');
+    py.push('    if not tsv_file or not os.path.exists(tsv_file): return words');
     py.push('    for line in open(tsv_file, encoding="utf-8").read().splitlines()[1:]:');
     py.push('        p = line.split("\\t")');
     py.push('        if len(p) < 12: continue');
@@ -284,57 +282,48 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     py.push('        except: pass');
     py.push('    return words');
     py.push('');
-    py.push('# Get first page size');
+    py.push('def escape_pdf(s):');
+    py.push('    return s.replace("\\\\","\\\\\\\\").replace("(","\\\\(").replace(")","\\\\)")');
+    py.push('');
     py.push('img0  = Image.open(pages[0])');
     py.push('w0,h0 = img0.size');
     py.push('c = canvas.Canvas(out_path, pagesize=(w0*SCALE, h0*SCALE))');
     py.push('');
     py.push('for i,(png,tsv) in enumerate(zip(pages,tsvs)):');
     py.push('    img    = Image.open(png)');
-    py.push('    iw, ih = img.size');
-    py.push('    pw, ph = iw*SCALE, ih*SCALE');
+    py.push('    iw,ih  = img.size');
+    py.push('    pw,ph  = iw*SCALE, ih*SCALE');
     py.push('    c.setPageSize((pw, ph))');
     py.push('');
-    py.push('    # 1. Draw the scanned image as background');
+    py.push('    # Draw scanned image as background');
     py.push('    c.drawImage(ImageReader(img), 0, 0, width=pw, height=ph)');
     py.push('');
-    py.push('    # 2. Invisible text layer using raw PDF content stream');
-    py.push('    # We inject raw PDF operators directly into the content stream');
-    py.push('    # BT = begin text, ET = end text');
-    py.push('    # 3 Tr = text render mode 3 (invisible: no fill no stroke)');
-    py.push('    # This is the EXACT same method used by Adobe Acrobat OCR');
+    py.push('    # Invisible text layer on top');
+    py.push('    # Use Tm (absolute text matrix) per word — no cumulative offset errors');
     py.push('    words = parse_tsv(tsv)');
     py.push('    if words:');
-    py.push('        c._code.append("q")          # save graphics state');
-    py.push('        c._code.append("BT")         # begin text');
-    py.push('        c._code.append("3 Tr")       # invisible render mode');
+    py.push('        c._code.append("q")');
+    py.push('        c._code.append("BT")');
+    py.push('        c._code.append("3 Tr")');
     py.push('        for (text, left, top, width, height) in words:');
     py.push('            if width <= 0 or height <= 0: continue');
-    py.push('            x  = left  * SCALE');
+    py.push('            x  = left * SCALE');
+    py.push('            # PDF Y: flip from top-left to bottom-left origin');
     py.push('            y  = ph - (top + height) * SCALE');
     py.push('            w  = width  * SCALE');
     py.push('            h  = height * SCALE');
-    py.push('            fs = max(h, 1.0)');
-    py.push('            # Escape PDF string special characters');
-    py.push('            safe = text.replace("\\\\","\\\\\\\\").replace("(","\\\\(").replace(")","\\\\)")');
-    py.push('            # Calculate horizontal scaling to fit word width');
-    py.push('            # Helvetica char width ~ 0.5 * fontSize per char');
-    py.push('            nom_w = len(text) * 0.5 * fs');
-    py.push('            hz = (w / nom_w * 100) if nom_w > 0 else 100');
-    py.push('            hz = max(10, min(hz, 2000))');
-    py.push('            # Set font, position, scale, draw');
-    py.push('            c._code.append("/F1 %g Tf" % fs)');
-    py.push('            c._code.append("%g Tz" % hz)');
-    py.push('            c._code.append("%g %g Td" % (x, y))');
+    py.push('            fs = max(h * 0.9, 1.0)');
+    py.push('            safe = escape_pdf(text)');
+    py.push('            # Tm = absolute text matrix [fs 0 0 fs x y]');
+    py.push('            # This positions each word independently — no drift');
+    py.push('            c._code.append("%g 0 0 %g %g %g Tm" % (fs, fs, x, y))');
     py.push('            c._code.append("(%s) Tj" % safe)');
-    py.push('            c._code.append("%g %g Td" % (-x, -y))');
-    py.push('        c._code.append("ET")         # end text');
-    py.push('        c._code.append("Q")          # restore graphics state');
+    py.push('        c._code.append("ET")');
+    py.push('        c._code.append("Q")');
     py.push('');
     py.push('    c.showPage()');
-    py.push('    print("Page %d done" % (i+1))');
+    py.push('    print("Page %d/%d done" % (i+1, len(pages)))');
     py.push('');
-    py.push('# Register F1 font resource');
     py.push('c.save()');
     py.push('print("PDF saved: " + out_path)');
 
