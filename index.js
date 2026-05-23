@@ -198,182 +198,220 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
 });
 
 // ── POST /ocr-pdf ──────────────────────────────────────────────────────────
+// ── POST /ocr-pdf ──────────────────────────────────────────────────────────
 app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
-  const tmpDir = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+
+  const tmpDir = path.join(
+    os.tmpdir(),
+    'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+  );
+
   try {
-    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+
+    if (!req.file) {
+      return res.status(400).json({
+        error: 'No PDF file uploaded'
+      });
+    }
+
     const header = req.file.buffer.slice(0, 5).toString('ascii');
-    if (!header.startsWith('%PDF')) return res.status(400).json({ error: 'Only PDF files are accepted' });
 
-    const lang = (req.body.lang || 'eng').replace(/[^a-z_]/g, '');
-    const validLangs = ['eng','ara','urd','fra','deu','spa','por','ita','nld','rus',
-      'chi_sim','chi_tra','jpn','kor','hin','ben','tur','pol','ukr','vie',
-      'tha','heb','fas','swe','nor','dan','fin','ces','ron','hun','ind','afr','swa'];
-    const safeLang   = validLangs.includes(lang) ? lang : 'eng';
-    const tessData   = path.join(TESSDATA, safeLang + '.traineddata');
-    const actualLang = fs.existsSync(tessData) ? safeLang : 'eng';
+    if (!header.startsWith('%PDF')) {
+      return res.status(400).json({
+        error: 'Only PDF files are accepted'
+      });
+    }
 
-    console.log('OCR: ' + req.file.originalname + ' (' + req.file.size + ' bytes) lang=' + actualLang);
+    const lang = (req.body.lang || 'eng')
+      .replace(/[^a-z_]/g, '');
+
+    const validLangs = [
+      'eng','ara','urd','fra','deu','spa','por','ita',
+      'nld','rus','chi_sim','chi_tra','jpn','kor',
+      'hin','ben','tur','pol','ukr','vie','tha',
+      'heb','fas','swe','nor','dan','fin','ces',
+      'ron','hun','ind','afr','swa'
+    ];
+
+    const safeLang = validLangs.includes(lang)
+      ? lang
+      : 'eng';
+
+    const tessData = path.join(
+      TESSDATA,
+      safeLang + '.traineddata'
+    );
+
+    const actualLang = fs.existsSync(tessData)
+      ? safeLang
+      : 'eng';
+
+    console.log(
+      'OCR: ' +
+      req.file.originalname +
+      ' (' +
+      req.file.size +
+      ' bytes) lang=' +
+      actualLang
+    );
+
     fs.mkdirSync(tmpDir, { recursive: true });
-    fs.writeFileSync(path.join(tmpDir, 'input.pdf'), req.file.buffer);
 
-    // STEP 1: Ghostscript → PNG at 300 DPI
-    console.log('OCR: Rendering pages...');
-    await runCmd(GS, [
-      '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
-      '-sDEVICE=png16m', '-r300',
-      '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4', '-dUseCropBox',
-      '-sOutputFile=' + path.join(tmpDir, 'page_%04d.png'),
-      path.join(tmpDir, 'input.pdf')
-    ], process.env, 120000);
+    const inputPdf = path.join(tmpDir, 'input.pdf');
+
+    fs.writeFileSync(inputPdf, req.file.buffer);
+
+    // STEP 1 — Render PDF pages to PNG
+
+    console.log('OCR: Rendering PDF pages...');
+
+    await runCmd(
+      GS,
+      [
+        '-q',
+        '-dBATCH',
+        '-dNOPAUSE',
+        '-dSAFER',
+        '-dAutoRotatePages=/None',
+        '-sDEVICE=png16m',
+        '-r200',
+        '-dTextAlphaBits=4',
+        '-dGraphicsAlphaBits=4',
+        '-dUseCropBox',
+        '-sOutputFile=' + path.join(tmpDir, 'page_%04d.png'),
+        inputPdf
+      ],
+      process.env,
+      120000
+    );
 
     const pages = fs.readdirSync(tmpDir)
-      .filter(f => f.match(/^page_\d+\.png$/))
+      .filter(f => /^page_\d+\.png$/.test(f))
       .sort()
       .map(f => path.join(tmpDir, f));
 
-    if (!pages.length) throw new Error('No pages could be rendered');
-    console.log('OCR: Rendered ' + pages.length + ' pages');
-
-    // STEP 2: Tesseract → TSV per page (word bounding boxes)
-    const pageTsvs  = [];
-    const pageTexts = [];
-    for (let i = 0; i < pages.length; i++) {
-      const outBase = path.join(tmpDir, 'tess_' + String(i).padStart(4,'0'));
-      console.log('OCR: Tesseract page ' + (i+1) + '/' + pages.length);
-      try {
-        await runCmd(TESSERACT, [
-          path.resolve(pages[i]), path.resolve(outBase),
-          '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv'
-        ], TESS_ENV, 120000);
-        const tsv = outBase + '.tsv';
-        if (fs.existsSync(tsv)) {
-          pageTsvs.push(tsv);
-          const words = fs.readFileSync(tsv, 'utf8').split('\n').slice(1)
-            .map(l => l.split('\t'))
-            .filter(p => p.length >= 12 && parseFloat(p[10]) > 0 && p[11] && p[11].trim())
-            .map(p => p[11].trim());
-          pageTexts.push(words.join(' '));
-          console.log('OCR: Page ' + (i+1) + ' → ' + words.length + ' words');
-        } else {
-          pageTsvs.push(null);
-          pageTexts.push('');
-          console.log('OCR: Page ' + (i+1) + ' → no TSV');
-        }
-      } catch(e) {
-        console.error('OCR: Tesseract p' + (i+1) + ' failed:', e.message);
-        pageTsvs.push(null);
-        pageTexts.push('');
-      }
+    if (!pages.length) {
+      throw new Error('No pages rendered from PDF');
     }
 
-    // STEP 3: Python builds searchable PDF
-    // Key fix: use beginText() + setTextRenderMode(3) instead of _code injection
-    // beginText() correctly handles graphics state after drawImage()
-    console.log('OCR: Building searchable PDF...');
+    console.log('OCR: Rendered ' + pages.length + ' pages');
 
-    const pyScript      = path.join(tmpDir, 'build_pdf.py');
-    const pagesJsonFile = path.join(tmpDir, 'pages.json');
-    const tsvsJsonFile  = path.join(tmpDir, 'tsvs.json');
-    const finalPdf      = path.join(tmpDir, 'final.pdf');
+    // STEP 2 — OCR each page directly into searchable PDF
 
-    fs.writeFileSync(pagesJsonFile, JSON.stringify(pages));
-    fs.writeFileSync(tsvsJsonFile,  JSON.stringify(pageTsvs));
+    const pdfPages = [];
 
-    const py = [];
-    py.push('import sys, json, os');
-    py.push('from PIL import Image');
-    py.push('from reportlab.pdfgen import canvas');
-    py.push('from reportlab.lib.utils import ImageReader');
-    py.push('');
-    py.push('pages    = json.loads(open(sys.argv[1]).read())');
-    py.push('tsvs     = json.loads(open(sys.argv[2]).read())');
-    py.push('out_path = sys.argv[3]');
-    py.push('SCALE    = 72.0 / 300.0');
-    py.push('');
-    py.push('def parse_tsv(tsv_file):');
-    py.push('    words = []');
-    py.push('    if not tsv_file or not os.path.exists(tsv_file): return words');
-    py.push('    for line in open(tsv_file, encoding="utf-8").read().splitlines()[1:]:');
-    py.push('        p = line.split("\\t")');
-    py.push('        if len(p) < 12: continue');
-    py.push('        try:');
-    py.push('            if float(p[10]) < 0: continue');
-    py.push('            text = p[11].strip()');
-    py.push('            if not text: continue');
-    py.push('            left, top, width, height = int(p[6]), int(p[7]), int(p[8]), int(p[9])');
-    py.push('            if width > 0 and height > 0:');
-    py.push('                words.append((text, left, top, width, height))');
-    py.push('        except: pass');
-    py.push('    return words');
-    py.push('');
-    py.push('img0   = Image.open(pages[0])');
-    py.push('w0, h0 = img0.size');
-    py.push('c = canvas.Canvas(out_path, pagesize=(w0*SCALE, h0*SCALE))');
-    py.push('');
-    py.push('for i, (png, tsv) in enumerate(zip(pages, tsvs)):');
-    py.push('    img    = Image.open(png)');
-    py.push('    iw, ih = img.size');
-    py.push('    pw, ph = iw*SCALE, ih*SCALE');
-    py.push('    c.setPageSize((pw, ph))');
-    py.push('');
-    py.push('    # Draw scanned image as background');
-    py.push('    c.drawImage(ImageReader(img), 0, 0, width=pw, height=ph)');
-    py.push('');
-    py.push('    # Invisible text layer using beginText() + setTextRenderMode(3)');
-    py.push('    # This is the correct ReportLab API that survives drawImage graphics state');
-    py.push('    words = parse_tsv(tsv)');
-    py.push('    if words:');
-    py.push('        t = c.beginText()');
-    py.push('        t.setTextRenderMode(3)  # 3 = invisible: no fill, no stroke');
-    py.push('        for (text, left, top, width, height) in words:');
-    py.push('            x  = left * SCALE');
-    py.push('            y  = ph - (top + height) * SCALE');
-    py.push('            fs = max(height * SCALE * 0.9, 1.0)');
-    py.push('            t.setFont("Helvetica", fs)');
-    py.push('            t.setTextOrigin(x, y)');
-    py.push('            t.textLine(text)');
-    py.push('        c.drawText(t)');
-    py.push('    print("Page %d: %d words" % (i+1, len(words)))');
-    py.push('    c.showPage()');
-    py.push('');
-    py.push('c.save()');
-    py.push('print("PDF saved: " + out_path)');
+    for (let i = 0; i < pages.length; i++) {
 
-    fs.writeFileSync(pyScript, py.join('\n'));
+      console.log(
+        'OCR: Processing page ' +
+        (i + 1) +
+        '/' +
+        pages.length
+      );
 
-    const pyResult = await runCmd(PYTHON3, [
-      pyScript, pagesJsonFile, tsvsJsonFile, finalPdf
-    ], PY_ENV, 300000);
+      const img = pages[i];
 
-    console.log('OCR: Python:', pyResult.stdout.trim().split('\n').pop());
-    if (!fs.existsSync(finalPdf)) throw new Error('Python failed to create PDF');
-    console.log('OCR: Final PDF: ' + fs.statSync(finalPdf).size + ' bytes');
+      const outBase = path.join(
+        tmpDir,
+        'ocr_' + String(i).padStart(4, '0')
+      );
+
+      await runCmd(
+        TESSERACT,
+        [
+          img,
+          outBase,
+          '-l',
+          actualLang,
+          '--oem',
+          '1',
+          '--psm',
+          '6',
+          'pdf'
+        ],
+        TESS_ENV,
+        120000
+      );
+
+      const pagePdf = outBase + '.pdf';
+
+      if (!fs.existsSync(pagePdf)) {
+        throw new Error(
+          'Tesseract failed on page ' + (i + 1)
+        );
+      }
+
+      pdfPages.push(pagePdf);
+    }
+
+    // STEP 3 — Merge all searchable PDF pages
+
+    console.log('OCR: Merging PDF pages...');
+
+    const finalPdf = path.join(tmpDir, 'final.pdf');
+
+    await runCmd(
+      GS,
+      [
+        '-dBATCH',
+        '-dNOPAUSE',
+        '-q',
+        '-sDEVICE=pdfwrite',
+        '-sOutputFile=' + finalPdf,
+        ...pdfPages
+      ],
+      process.env,
+      120000
+    );
+
+    if (!fs.existsSync(finalPdf)) {
+      throw new Error('Failed to merge OCR PDF pages');
+    }
 
     const resultBuf = fs.readFileSync(finalPdf);
-    const outName   = (req.file.originalname || 'document').replace(/\.pdf$/i,'') + '-searchable.pdf';
-    const allText   = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
-    const textB64   = Buffer.from(allText.substring(0, 6000)).toString('base64');
 
-    console.log('OCR: Done — ' + resultBuf.length + ' bytes, ' + pages.length + ' pages');
+    const outName = (
+      req.file.originalname || 'document'
+    ).replace(/\.pdf$/i, '') + '-searchable.pdf';
+
+    console.log(
+      'OCR complete: ' +
+      resultBuf.length +
+      ' bytes'
+    );
 
     res.set({
-      'Content-Type':        'application/pdf',
-      'Content-Disposition': 'attachment; filename="' + outName + '"',
-      'Content-Length':      resultBuf.length,
-      'X-OCR-Pages':         pages.length,
-      'X-OCR-Lang':          actualLang,
-      'X-OCR-Text':          textB64,
-      'Access-Control-Expose-Headers': 'X-OCR-Pages, X-OCR-Lang, X-OCR-Text'
+      'Content-Type': 'application/pdf',
+      'Content-Disposition':
+        'attachment; filename="' + outName + '"',
+      'Content-Length': resultBuf.length,
+      'X-OCR-Pages': pages.length,
+      'X-OCR-Lang': actualLang,
+      'Access-Control-Expose-Headers':
+        'X-OCR-Pages, X-OCR-Lang'
     });
+
     res.send(resultBuf);
 
   } catch(err) {
+
     console.error('ocr-pdf error:', err.message);
-    res.status(500).json({ error: err.message || 'OCR processing failed' });
+
+    res.status(500).json({
+      error: err.message || 'OCR processing failed'
+    });
+
   } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+
+    try {
+      fs.rmSync(tmpDir, {
+        recursive: true,
+        force: true
+      });
+    } catch(e) {}
+
   }
+
 });
 
 // ── Status / ping ──────────────────────────────────────────────────────────
