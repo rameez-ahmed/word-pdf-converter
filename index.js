@@ -55,6 +55,21 @@ const PY_ENV = Object.assign({}, process.env, {
   PYTHONPATH: PYTHONPATH
 });
 
+// ── Create Tesseract config files on startup ──
+// The static binary needs these config files to output hocr/tsv formats
+function setupTesseractConfigs() {
+  const configDir = path.join(TESSDATA, 'configs');
+  try {
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, 'tsv'),  'tessedit_create_tsv 1\n');
+    fs.writeFileSync(path.join(configDir, 'hocr'), 'tessedit_create_hocr 1\n');
+    console.log('Tesseract configs created at', configDir);
+  } catch(e) {
+    console.error('Failed to create tesseract configs:', e.message);
+  }
+}
+setupTesseractConfigs();
+
 let loQueue = Promise.resolve();
 let isConverting = false;
 
@@ -221,7 +236,8 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     if (!pages.length) throw new Error('No pages could be rendered');
     console.log('OCR: Rendered ' + pages.length + ' pages');
 
-    // STEP 2: Tesseract → tsv + txt per page
+    // STEP 2: Tesseract → tsv per page (word bounding boxes)
+    // tsv config file was created on startup so this now works
     const pageTsvs  = [];
     const pageTexts = [];
     for (let i = 0; i < pages.length; i++) {
@@ -230,13 +246,26 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       try {
         await runCmd(TESSERACT, [
           path.resolve(pages[i]), path.resolve(outBase),
-          '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv', 'txt'
+          '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv'
         ], TESS_ENV, 120000);
         const tsv = outBase + '.tsv';
-        const txt = outBase + '.txt';
-        pageTsvs.push(fs.existsSync(tsv) ? tsv : null);
-        pageTexts.push(fs.existsSync(txt) ? fs.readFileSync(txt, 'utf8').trim() : '');
-        console.log('OCR: Page ' + (i+1) + ' → ' + pageTexts[i].length + ' chars');
+        if (fs.existsSync(tsv)) {
+          pageTsvs.push(tsv);
+          // Extract plain text from TSV for the text panel
+          const lines = fs.readFileSync(tsv, 'utf8').splitlines ? 
+            fs.readFileSync(tsv, 'utf8').split('\n') :
+            fs.readFileSync(tsv, 'utf8').split('\n');
+          const words = lines.slice(1)
+            .map(l => l.split('\t'))
+            .filter(p => p.length >= 12 && parseFloat(p[10]) > 0 && p[11].trim())
+            .map(p => p[11].trim());
+          pageTexts.push(words.join(' '));
+          console.log('OCR: Page ' + (i+1) + ' → ' + words.length + ' words');
+        } else {
+          console.error('OCR: No TSV for page ' + (i+1));
+          pageTsvs.push(null);
+          pageTexts.push('');
+        }
       } catch(e) {
         console.error('OCR: Tesseract p' + (i+1) + ' failed:', e.message);
         pageTsvs.push(null);
@@ -245,8 +274,7 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     }
 
     // STEP 3: Python/ReportLab → searchable PDF
-    // Image drawn first, then invisible text on top using Tm (absolute matrix)
-    // Tm places each word independently — no cumulative Td offset errors
+    // Draw image first, then invisible text using Tm absolute positioning
     console.log('OCR: Building searchable PDF...');
 
     const pyScript      = path.join(tmpDir, 'build_pdf.py');
@@ -266,63 +294,62 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     py.push('pages    = json.loads(open(sys.argv[1]).read())');
     py.push('tsvs     = json.loads(open(sys.argv[2]).read())');
     py.push('out_path = sys.argv[3]');
-    py.push('SCALE    = 72.0 / 300.0');
+    py.push('SCALE    = 72.0 / 300.0  # 300 DPI render -> PDF points');
     py.push('');
     py.push('def parse_tsv(tsv_file):');
     py.push('    words = []');
     py.push('    if not tsv_file or not os.path.exists(tsv_file): return words');
-    py.push('    for line in open(tsv_file, encoding="utf-8").read().splitlines()[1:]:');
+    py.push('    lines = open(tsv_file, encoding="utf-8").read().splitlines()');
+    py.push('    for line in lines[1:]:');
     py.push('        p = line.split("\\t")');
     py.push('        if len(p) < 12: continue');
     py.push('        try:');
-    py.push('            if float(p[10]) < 0: continue');
-    py.push('            t = p[11].strip()');
-    py.push('            if not t: continue');
-    py.push('            words.append((t, int(p[6]), int(p[7]), int(p[8]), int(p[9])))');
+    py.push('            conf = float(p[10])');
+    py.push('            if conf < 0: continue');
+    py.push('            text = p[11].strip()');
+    py.push('            if not text: continue');
+    py.push('            left   = int(p[6])');
+    py.push('            top    = int(p[7])');
+    py.push('            width  = int(p[8])');
+    py.push('            height = int(p[9])');
+    py.push('            if width > 0 and height > 0:');
+    py.push('                words.append((text, left, top, width, height))');
     py.push('        except: pass');
     py.push('    return words');
     py.push('');
-    py.push('def escape_pdf(s):');
+    py.push('def esc(s):');
     py.push('    return s.replace("\\\\","\\\\\\\\").replace("(","\\\\(").replace(")","\\\\)")');
     py.push('');
-    py.push('img0  = Image.open(pages[0])');
-    py.push('w0,h0 = img0.size');
+    py.push('img0   = Image.open(pages[0])');
+    py.push('w0, h0 = img0.size');
     py.push('c = canvas.Canvas(out_path, pagesize=(w0*SCALE, h0*SCALE))');
     py.push('');
-    py.push('for i,(png,tsv) in enumerate(zip(pages,tsvs)):');
+    py.push('for i, (png, tsv) in enumerate(zip(pages, tsvs)):');
     py.push('    img    = Image.open(png)');
-    py.push('    iw,ih  = img.size');
-    py.push('    pw,ph  = iw*SCALE, ih*SCALE');
+    py.push('    iw, ih = img.size');
+    py.push('    pw, ph = iw*SCALE, ih*SCALE');
     py.push('    c.setPageSize((pw, ph))');
     py.push('');
     py.push('    # Draw scanned image as background');
     py.push('    c.drawImage(ImageReader(img), 0, 0, width=pw, height=ph)');
     py.push('');
-    py.push('    # Invisible text layer on top');
-    py.push('    # Use Tm (absolute text matrix) per word — no cumulative offset errors');
+    py.push('    # Invisible text layer on top using Tm absolute matrix');
     py.push('    words = parse_tsv(tsv)');
+    py.push('    print("Page %d: %d words" % (i+1, len(words)))');
     py.push('    if words:');
     py.push('        c._code.append("q")');
     py.push('        c._code.append("BT")');
     py.push('        c._code.append("3 Tr")');
     py.push('        for (text, left, top, width, height) in words:');
-    py.push('            if width <= 0 or height <= 0: continue');
     py.push('            x  = left * SCALE');
-    py.push('            # PDF Y: flip from top-left to bottom-left origin');
     py.push('            y  = ph - (top + height) * SCALE');
-    py.push('            w  = width  * SCALE');
-    py.push('            h  = height * SCALE');
-    py.push('            fs = max(h * 0.9, 1.0)');
-    py.push('            safe = escape_pdf(text)');
-    py.push('            # Tm = absolute text matrix [fs 0 0 fs x y]');
-    py.push('            # This positions each word independently — no drift');
+    py.push('            fs = max(height * SCALE * 0.9, 1.0)');
     py.push('            c._code.append("%g 0 0 %g %g %g Tm" % (fs, fs, x, y))');
-    py.push('            c._code.append("(%s) Tj" % safe)');
+    py.push('            c._code.append("(%s) Tj" % esc(text))');
     py.push('        c._code.append("ET")');
     py.push('        c._code.append("Q")');
     py.push('');
     py.push('    c.showPage()');
-    py.push('    print("Page %d/%d done" % (i+1, len(pages)))');
     py.push('');
     py.push('c.save()');
     py.push('print("PDF saved: " + out_path)');
