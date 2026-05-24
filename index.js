@@ -62,7 +62,8 @@ function setupTesseractConfigs() {
     fs.mkdirSync(configDir, { recursive: true });
     fs.writeFileSync(path.join(configDir, 'tsv'),  'tessedit_create_tsv 1\n');
     fs.writeFileSync(path.join(configDir, 'hocr'), 'tessedit_create_hocr 1\n');
-    console.log('Tesseract configs ready');
+    fs.writeFileSync(path.join(configDir, 'pdf'),  'tessedit_create_pdf 1\n');
+    console.log('Tesseract configs ready (tsv, hocr, pdf)');
   } catch(e) {
     console.error('Tesseract config error:', e.message);
   }
@@ -198,6 +199,9 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
 });
 
 // ── POST /ocr-pdf ──────────────────────────────────────────────────────────
+// Clean pipeline: GS → PNG pages → Tesseract PDF per page → GS merge
+// Tesseract PDF output embeds: original image + invisible text layer
+// This is identical to what Adobe Acrobat and ilovepdf produce
 app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
   const tmpDir = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
   try {
@@ -217,8 +221,8 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     fs.mkdirSync(tmpDir, { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'input.pdf'), req.file.buffer);
 
-    // STEP 1: Ghostscript → PNG at 300 DPI
-    console.log('OCR: Rendering pages...');
+    // STEP 1: Ghostscript → PNG pages at 300 DPI
+    console.log('OCR: Rendering pages with Ghostscript...');
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=png16m', '-r300',
@@ -235,119 +239,66 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     if (!pages.length) throw new Error('No pages could be rendered');
     console.log('OCR: Rendered ' + pages.length + ' pages');
 
-    // STEP 2: Tesseract → TSV per page (word bounding boxes)
-    const pageTsvs  = [];
+    // STEP 2: Tesseract → PDF per page
+    // Tesseract PDF output contains:
+    //   - The original PNG image embedded at correct size
+    //   - An invisible text layer with exact word positions
+    // This is the native, proper way — no coordinate math needed
+    const pagePdfs = [];
     const pageTexts = [];
+
     for (let i = 0; i < pages.length; i++) {
       const outBase = path.join(tmpDir, 'tess_' + String(i).padStart(4,'0'));
       console.log('OCR: Tesseract page ' + (i+1) + '/' + pages.length);
       try {
         await runCmd(TESSERACT, [
-          path.resolve(pages[i]), path.resolve(outBase),
-          '-l', actualLang, '--oem', '1', '--psm', '3', 'tsv'
+          path.resolve(pages[i]),
+          path.resolve(outBase),
+          '-l', actualLang,
+          '--oem', '1',
+          '--psm', '3',
+          'pdf',   // Tesseract creates searchable PDF natively
+          'txt'    // Also get plain text for the text panel
         ], TESS_ENV, 120000);
-        const tsv = outBase + '.tsv';
-        if (fs.existsSync(tsv)) {
-          pageTsvs.push(tsv);
-          const words = fs.readFileSync(tsv, 'utf8').split('\n').slice(1)
-            .map(l => l.split('\t'))
-            .filter(p => p.length >= 12 && parseFloat(p[10]) > 0 && p[11] && p[11].trim())
-            .map(p => p[11].trim());
-          pageTexts.push(words.join(' '));
-          console.log('OCR: Page ' + (i+1) + ' → ' + words.length + ' words');
+
+        const pdfOut = outBase + '.pdf';
+        const txtOut = outBase + '.txt';
+
+        if (fs.existsSync(pdfOut)) {
+          pagePdfs.push(pdfOut);
+          console.log('OCR: Page ' + (i+1) + ' PDF: ' + fs.statSync(pdfOut).size + ' bytes');
         } else {
-          pageTsvs.push(null);
-          pageTexts.push('');
-          console.log('OCR: Page ' + (i+1) + ' → no TSV');
+          console.error('OCR: No PDF for page ' + (i+1));
         }
+
+        if (fs.existsSync(txtOut)) {
+          pageTexts.push(fs.readFileSync(txtOut, 'utf8').trim());
+        } else {
+          pageTexts.push('');
+        }
+
       } catch(e) {
         console.error('OCR: Tesseract p' + (i+1) + ' failed:', e.message);
-        pageTsvs.push(null);
         pageTexts.push('');
       }
     }
 
-    // STEP 3: Python builds searchable PDF
-    // Key fix: use beginText() + setTextRenderMode(3) instead of _code injection
-    // beginText() correctly handles graphics state after drawImage()
-    console.log('OCR: Building searchable PDF...');
+    if (!pagePdfs.length) throw new Error('Tesseract failed to create any page PDFs');
+    console.log('OCR: Got ' + pagePdfs.length + '/' + pages.length + ' page PDFs');
 
-    const pyScript      = path.join(tmpDir, 'build_pdf.py');
-    const pagesJsonFile = path.join(tmpDir, 'pages.json');
-    const tsvsJsonFile  = path.join(tmpDir, 'tsvs.json');
-    const finalPdf      = path.join(tmpDir, 'final.pdf');
+    // STEP 3: Ghostscript merges all page PDFs into one final PDF
+    const finalPdf = path.join(tmpDir, 'final.pdf');
+    console.log('OCR: Merging ' + pagePdfs.length + ' pages...');
+    await runCmd(GS, [
+      '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
+      '-sDEVICE=pdfwrite',
+      '-dCompatibilityLevel=1.5',
+      '-dPDFSETTINGS=/default',
+      '-sOutputFile=' + finalPdf,
+      ...pagePdfs
+    ], process.env, 120000);
 
-    fs.writeFileSync(pagesJsonFile, JSON.stringify(pages));
-    fs.writeFileSync(tsvsJsonFile,  JSON.stringify(pageTsvs));
-
-    const py = [];
-    py.push('import sys, json, os');
-    py.push('from PIL import Image');
-    py.push('from reportlab.pdfgen import canvas');
-    py.push('from reportlab.lib.utils import ImageReader');
-    py.push('');
-    py.push('pages    = json.loads(open(sys.argv[1]).read())');
-    py.push('tsvs     = json.loads(open(sys.argv[2]).read())');
-    py.push('out_path = sys.argv[3]');
-    py.push('SCALE    = 72.0 / 300.0');
-    py.push('');
-    py.push('def parse_tsv(tsv_file):');
-    py.push('    words = []');
-    py.push('    if not tsv_file or not os.path.exists(tsv_file): return words');
-    py.push('    for line in open(tsv_file, encoding="utf-8").read().splitlines()[1:]:');
-    py.push('        p = line.split("\\t")');
-    py.push('        if len(p) < 12: continue');
-    py.push('        try:');
-    py.push('            if float(p[10]) < 0: continue');
-    py.push('            text = p[11].strip()');
-    py.push('            if not text: continue');
-    py.push('            left, top, width, height = int(p[6]), int(p[7]), int(p[8]), int(p[9])');
-    py.push('            if width > 0 and height > 0:');
-    py.push('                words.append((text, left, top, width, height))');
-    py.push('        except: pass');
-    py.push('    return words');
-    py.push('');
-    py.push('img0   = Image.open(pages[0])');
-    py.push('w0, h0 = img0.size');
-    py.push('c = canvas.Canvas(out_path, pagesize=(w0*SCALE, h0*SCALE))');
-    py.push('');
-    py.push('for i, (png, tsv) in enumerate(zip(pages, tsvs)):');
-    py.push('    img    = Image.open(png)');
-    py.push('    iw, ih = img.size');
-    py.push('    pw, ph = iw*SCALE, ih*SCALE');
-    py.push('    c.setPageSize((pw, ph))');
-    py.push('');
-    py.push('    # Draw scanned image as background');
-    py.push('    c.drawImage(ImageReader(img), 0, 0, width=pw, height=ph)');
-    py.push('');
-    py.push('    # Invisible text layer using beginText() + setTextRenderMode(3)');
-    py.push('    # This is the correct ReportLab API that survives drawImage graphics state');
-    py.push('    words = parse_tsv(tsv)');
-    py.push('    if words:');
-    py.push('        t = c.beginText()');
-    py.push('        t.setTextRenderMode(3)  # 3 = invisible: no fill, no stroke');
-    py.push('        for (text, left, top, width, height) in words:');
-    py.push('            x  = left * SCALE');
-    py.push('            y  = ph - (top + height) * SCALE');
-    py.push('            fs = max(height * SCALE * 0.9, 1.0)');
-    py.push('            t.setFont("Helvetica", fs)');
-    py.push('            t.setTextOrigin(x, y)');
-    py.push('            t.textLine(text)');
-    py.push('        c.drawText(t)');
-    py.push('    print("Page %d: %d words" % (i+1, len(words)))');
-    py.push('    c.showPage()');
-    py.push('');
-    py.push('c.save()');
-    py.push('print("PDF saved: " + out_path)');
-
-    fs.writeFileSync(pyScript, py.join('\n'));
-
-    const pyResult = await runCmd(PYTHON3, [
-      pyScript, pagesJsonFile, tsvsJsonFile, finalPdf
-    ], PY_ENV, 300000);
-
-    console.log('OCR: Python:', pyResult.stdout.trim().split('\n').pop());
-    if (!fs.existsSync(finalPdf)) throw new Error('Python failed to create PDF');
+    if (!fs.existsSync(finalPdf)) throw new Error('Failed to merge pages into final PDF');
     console.log('OCR: Final PDF: ' + fs.statSync(finalPdf).size + ' bytes');
 
     const resultBuf = fs.readFileSync(finalPdf);
