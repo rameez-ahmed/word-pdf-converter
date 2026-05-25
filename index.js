@@ -63,6 +63,7 @@ function setupTesseractConfigs() {
     fs.writeFileSync(path.join(configDir, 'tsv'),  'tessedit_create_tsv 1\n');
     fs.writeFileSync(path.join(configDir, 'hocr'), 'tessedit_create_hocr 1\n');
     fs.writeFileSync(path.join(configDir, 'pdf'),  'tessedit_create_pdf 1\n');
+    fs.writeFileSync(path.join(configDir, 'txt'),  'tessedit_create_txt 1\n');
     console.log('Tesseract configs ready (tsv, hocr, pdf)');
   } catch(e) {
     console.error('Tesseract config error:', e.message);
@@ -237,6 +238,7 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       .map(f => path.join(tmpDir, f));
 
     if (!pages.length) throw new Error('No pages could be rendered');
+    if (pages.length > 50) throw new Error('This PDF has ' + pages.length + ' pages. Maximum is 50 pages. Please split the PDF into smaller parts first.');
     console.log('OCR: Rendered ' + pages.length + ' pages');
 
     // STEP 2: Tesseract → PDF per page
@@ -257,8 +259,8 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
           '-l', actualLang,
           '--oem', '1',
           '--psm', '3',
-          'pdf',   // Tesseract creates searchable PDF natively
-          'txt'    // Also get plain text for the text panel
+          'pdf',   // searchable PDF with invisible text layer
+          'txt'    // plain text for the text panel
         ], TESS_ENV, 120000);
 
         const pdfOut = outBase + '.pdf';
