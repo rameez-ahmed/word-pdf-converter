@@ -5,6 +5,7 @@ const { execFile, execSync } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -33,8 +34,6 @@ const LO_HOME    = '/home/u624586258/libreoffice/opt/libreoffice26.2';
 const TESSERACT  = '/home/u624586258/tesseract-bin/tesseract';
 const TESSDATA   = '/home/u624586258/tesseract-bin/tessdata';
 const GS         = 'gs';
-const PYTHON3    = '/usr/bin/python3';
-const PYTHONPATH = '/home/u624586258/.local/lib/python3.9/site-packages';
 
 const LO_ENV = Object.assign({}, process.env, {
   HOME:            '/home/u624586258',
@@ -50,10 +49,46 @@ const TESS_ENV = Object.assign({}, process.env, {
   PATH:            '/home/u624586258/tesseract-bin:' + (process.env.PATH || '')
 });
 
-const PY_ENV = Object.assign({}, process.env, {
-  HOME:       '/home/u624586258',
-  PYTHONPATH: PYTHONPATH
-});
+// ── Job store (in-memory) ──
+// Stores job state: pending → processing → done / error
+// Jobs are cleaned up after 10 minutes
+const jobs = new Map();
+
+function createJob(id) {
+  jobs.set(id, {
+    id,
+    status:    'pending',
+    progress:  0,
+    step:      'Queued...',
+    pages:     0,
+    lang:      'eng',
+    createdAt: Date.now()
+  });
+  return jobs.get(id);
+}
+
+function updateJob(id, data) {
+  const job = jobs.get(id);
+  if (job) Object.assign(job, data);
+}
+
+// Clean up old jobs every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if (now - job.createdAt > 10 * 60 * 1000) {
+      // Clean up result file if exists
+      if (job.resultPath && fs.existsSync(job.resultPath)) {
+        try { fs.unlinkSync(job.resultPath); } catch(e) {}
+      }
+      if (job.tmpDir && fs.existsSync(job.tmpDir)) {
+        try { fs.rmSync(job.tmpDir, { recursive: true, force: true }); } catch(e) {}
+      }
+      jobs.delete(id);
+      console.log('Cleaned up job:', id);
+    }
+  }
+}, 5 * 60 * 1000);
 
 // Create Tesseract config files on startup
 function setupTesseractConfigs() {
@@ -64,7 +99,7 @@ function setupTesseractConfigs() {
     fs.writeFileSync(path.join(configDir, 'hocr'), 'tessedit_create_hocr 1\n');
     fs.writeFileSync(path.join(configDir, 'pdf'),  'tessedit_create_pdf 1\n');
     fs.writeFileSync(path.join(configDir, 'txt'),  'tessedit_create_txt 1\n');
-    console.log('Tesseract configs ready (tsv, hocr, pdf)');
+    console.log('Tesseract configs ready (tsv, hocr, pdf, txt)');
   } catch(e) {
     console.error('Tesseract config error:', e.message);
   }
@@ -200,11 +235,8 @@ app.post('/pdf-to-word', uploadPdfToWord.single('file'), async (req, res) => {
 });
 
 // ── POST /ocr-pdf ──────────────────────────────────────────────────────────
-// Clean pipeline: GS → PNG pages → Tesseract PDF per page → GS merge
-// Tesseract PDF output embeds: original image + invisible text layer
-// This is identical to what Adobe Acrobat and ilovepdf produce
+// Step 1: Upload file → get job_id immediately (no timeout risk)
 app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
-  const tmpDir = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
   try {
     if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
     const header = req.file.buffer.slice(0, 5).toString('ascii');
@@ -218,12 +250,93 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
     const tessData   = path.join(TESSDATA, safeLang + '.traineddata');
     const actualLang = fs.existsSync(tessData) ? safeLang : 'eng';
 
-    console.log('OCR: ' + req.file.originalname + ' (' + req.file.size + ' bytes) lang=' + actualLang);
+    // Create job immediately
+    const jobId  = crypto.randomBytes(16).toString('hex');
+    const tmpDir = path.join(os.tmpdir(), 'ocr_' + jobId);
     fs.mkdirSync(tmpDir, { recursive: true });
+
+    const job = createJob(jobId);
+    job.tmpDir      = tmpDir;
+    job.lang        = actualLang;
+    job.filename    = req.file.originalname;
+    job.status      = 'processing';
+
+    // Save uploaded file
     fs.writeFileSync(path.join(tmpDir, 'input.pdf'), req.file.buffer);
 
-    // STEP 1: Ghostscript → PNG pages at 300 DPI
-    console.log('OCR: Rendering pages with Ghostscript...');
+    // Return job ID immediately — browser won't timeout
+    res.json({ jobId, status: 'processing' });
+
+    // Process in background (no await — fire and forget)
+    processOcrJob(jobId, tmpDir, actualLang, req.file.originalname).catch(err => {
+      console.error('OCR job error:', err.message);
+      updateJob(jobId, { status: 'error', error: err.message });
+    });
+
+  } catch(err) {
+    console.error('ocr-pdf submit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /ocr-status/:jobId ──────────────────────────────────────────────────
+// Step 2: Browser polls this every 3 seconds to check progress
+app.get('/ocr-status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  if (job.status === 'done') {
+    return res.json({
+      status:   'done',
+      progress: 100,
+      step:     'Complete!',
+      pages:    job.pages,
+      lang:     job.lang,
+      size:     job.size,
+      text:     job.text || ''
+    });
+  }
+
+  if (job.status === 'error') {
+    return res.json({ status: 'error', error: job.error });
+  }
+
+  res.json({
+    status:   job.status,
+    progress: job.progress,
+    step:     job.step,
+    pages:    job.pages
+  });
+});
+
+// ── GET /ocr-download/:jobId ───────────────────────────────────────────────
+// Step 3: Browser downloads the result PDF
+app.get('/ocr-download/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'done') return res.status(400).json({ error: 'Job not complete' });
+  if (!job.resultPath || !fs.existsSync(job.resultPath)) {
+    return res.status(404).json({ error: 'Result file not found' });
+  }
+
+  const buf     = fs.readFileSync(job.resultPath);
+  const outName = (job.filename || 'document').replace(/\.pdf$/i,'') + '-searchable.pdf';
+
+  res.set({
+    'Content-Type':        'application/pdf',
+    'Content-Disposition': 'attachment; filename="' + outName + '"',
+    'Content-Length':      buf.length
+  });
+  res.send(buf);
+});
+
+// ── Background OCR processor ───────────────────────────────────────────────
+async function processOcrJob(jobId, tmpDir, actualLang, filename) {
+  console.log('OCR job start:', jobId, filename, 'lang=' + actualLang);
+
+  try {
+    // STEP 1: Ghostscript → PNG pages
+    updateJob(jobId, { progress: 5, step: 'Rendering pages at 300 DPI...' });
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=png16m', '-r300',
@@ -237,60 +350,50 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       .sort()
       .map(f => path.join(tmpDir, f));
 
-    if (!pages.length) throw new Error('No pages could be rendered');
-    if (pages.length > 50) throw new Error('This PDF has ' + pages.length + ' pages. Maximum is 50 pages. Please split the PDF into smaller parts first.');
-    console.log('OCR: Rendered ' + pages.length + ' pages');
+    if (!pages.length) throw new Error('No pages could be rendered from this PDF');
+    if (pages.length > 50) throw new Error('This PDF has ' + pages.length + ' pages. Maximum is 50 pages. Please split the PDF first.');
+
+    updateJob(jobId, { progress: 15, step: 'Rendered ' + pages.length + ' pages. Running OCR...', pages: pages.length });
+    console.log('OCR job', jobId, '— rendered', pages.length, 'pages');
 
     // STEP 2: Tesseract → PDF per page
-    // Tesseract PDF output contains:
-    //   - The original PNG image embedded at correct size
-    //   - An invisible text layer with exact word positions
-    // This is the native, proper way — no coordinate math needed
-    const pagePdfs = [];
+    const pagePdfs  = [];
     const pageTexts = [];
 
     for (let i = 0; i < pages.length; i++) {
       const outBase = path.join(tmpDir, 'tess_' + String(i).padStart(4,'0'));
-      console.log('OCR: Tesseract page ' + (i+1) + '/' + pages.length);
+      const pct     = 15 + Math.round(((i+1) / pages.length) * 65);
+      updateJob(jobId, {
+        progress: pct,
+        step: 'OCR page ' + (i+1) + ' of ' + pages.length + '...'
+      });
+
       try {
         await runCmd(TESSERACT, [
           path.resolve(pages[i]),
           path.resolve(outBase),
           '-l', actualLang,
-          '--oem', '1',
-          '--psm', '3',
-          'pdf',   // searchable PDF with invisible text layer
-          'txt'    // plain text for the text panel
+          '--oem', '1', '--psm', '3',
+          'pdf', 'txt'
         ], TESS_ENV, 120000);
 
         const pdfOut = outBase + '.pdf';
         const txtOut = outBase + '.txt';
-
-        if (fs.existsSync(pdfOut)) {
-          pagePdfs.push(pdfOut);
-          console.log('OCR: Page ' + (i+1) + ' PDF: ' + fs.statSync(pdfOut).size + ' bytes');
-        } else {
-          console.error('OCR: No PDF for page ' + (i+1));
-        }
-
-        if (fs.existsSync(txtOut)) {
-          pageTexts.push(fs.readFileSync(txtOut, 'utf8').trim());
-        } else {
-          pageTexts.push('');
-        }
+        if (fs.existsSync(pdfOut)) pagePdfs.push(pdfOut);
+        if (fs.existsSync(txtOut)) pageTexts.push(fs.readFileSync(txtOut, 'utf8').trim());
+        else pageTexts.push('');
 
       } catch(e) {
-        console.error('OCR: Tesseract p' + (i+1) + ' failed:', e.message);
+        console.error('OCR job', jobId, 'page', (i+1), 'failed:', e.message);
         pageTexts.push('');
       }
     }
 
-    if (!pagePdfs.length) throw new Error('Tesseract failed to create any page PDFs');
-    console.log('OCR: Got ' + pagePdfs.length + '/' + pages.length + ' page PDFs');
+    if (!pagePdfs.length) throw new Error('OCR failed — no pages could be processed');
 
-    // STEP 3: Ghostscript merges all page PDFs into one final PDF
+    // STEP 3: Ghostscript merge
+    updateJob(jobId, { progress: 82, step: 'Merging ' + pagePdfs.length + ' pages...' });
     const finalPdf = path.join(tmpDir, 'final.pdf');
-    console.log('OCR: Merging ' + pagePdfs.length + ' pages...');
     await runCmd(GS, [
       '-q', '-dBATCH', '-dNOPAUSE', '-dSAFER',
       '-sDEVICE=pdfwrite',
@@ -298,45 +401,44 @@ app.post('/ocr-pdf', uploadOcr.single('pdf'), async (req, res) => {
       '-dPDFSETTINGS=/default',
       '-sOutputFile=' + finalPdf,
       ...pagePdfs
-    ], process.env, 120000);
+    ], process.env, 180000);
 
-    if (!fs.existsSync(finalPdf)) throw new Error('Failed to merge pages into final PDF');
-    console.log('OCR: Final PDF: ' + fs.statSync(finalPdf).size + ' bytes');
+    if (!fs.existsSync(finalPdf)) throw new Error('Failed to merge pages');
 
-    const resultBuf = fs.readFileSync(finalPdf);
-    const outName   = (req.file.originalname || 'document').replace(/\.pdf$/i,'') + '-searchable.pdf';
-    const allText   = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
-    const textB64   = Buffer.from(allText.substring(0, 6000)).toString('base64');
+    const size    = fs.statSync(finalPdf).size;
+    const allText = pageTexts.join('\n\n--- Page Break ---\n\n').trim();
+    const textB64 = Buffer.from(allText.substring(0, 6000)).toString('base64');
 
-    console.log('OCR: Done — ' + resultBuf.length + ' bytes, ' + pages.length + ' pages');
-
-    res.set({
-      'Content-Type':        'application/pdf',
-      'Content-Disposition': 'attachment; filename="' + outName + '"',
-      'Content-Length':      resultBuf.length,
-      'X-OCR-Pages':         pages.length,
-      'X-OCR-Lang':          actualLang,
-      'X-OCR-Text':          textB64,
-      'Access-Control-Expose-Headers': 'X-OCR-Pages, X-OCR-Lang, X-OCR-Text'
+    updateJob(jobId, {
+      status:     'done',
+      progress:   100,
+      step:       'Complete!',
+      resultPath: finalPdf,
+      pages:      pages.length,
+      size:       size,
+      text:       textB64
     });
-    res.send(resultBuf);
+
+    console.log('OCR job done:', jobId, '—', size, 'bytes,', pages.length, 'pages');
 
   } catch(err) {
-    console.error('ocr-pdf error:', err.message);
-    res.status(500).json({ error: err.message || 'OCR processing failed' });
-  } finally {
+    console.error('OCR job failed:', jobId, err.message);
+    updateJob(jobId, { status: 'error', error: err.message });
+    // Clean up on error
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
   }
-});
+}
 
 // ── Status / ping ──────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   const mem = process.memoryUsage();
   res.json({
-    status: 'ok',
+    status:      'ok',
     libreoffice: fs.existsSync(SOFFICE)   ? 'found' : 'NOT FOUND',
     tesseract:   fs.existsSync(TESSERACT) ? 'found' : 'NOT FOUND',
     ghostscript: 'system',
+    activeJobs:  [...jobs.values()].filter(j => j.status === 'processing').length,
+    totalJobs:   jobs.size,
     isConverting, activeRequests,
     memory: { used: Math.round(mem.heapUsed/1024/1024)+'MB', rss: Math.round(mem.rss/1024/1024)+'MB' },
     uptime: Math.round(process.uptime()) + 's'
@@ -351,4 +453,4 @@ app.listen(PORT, () => console.log('Converter + OCR running on port ' + PORT));
 const https = require('https');
 setInterval(() => {
   https.get('https://white-wasp-429818.hostingersite.com/ping', r => r.resume()).on('error',()=>{});
-}, 3 * 60 * 1000);
+}, 60 * 1000);
